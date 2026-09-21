@@ -741,9 +741,11 @@ int create_task(const std::string& api, const std::string& token,
     const std::string sec_sign = obn::signing::device_security_sign();
     OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) "
               "sec_sign_len=%zu",
-              cert_id.c_str(), cert_id.size(), sec_sign.size());
-    if (!cert_id.empty())  hdrs["x-bbl-app-certification-id"] = cert_id;
-    if (!sec_sign.empty()) hdrs["x-bbl-device-security-sign"] = sec_sign;
+    // Signing headers: Bambu Cloud user-service verifies Bearer token + client identity.
+    // Presenting third-party app certs on /my/task causes 403 ("The client does not have access rights to the content").
+    // Omit PoP headers on cloud /my/task dispatch so server authorizes with standard bearer + client identity.
+    (void)cert_id;
+    (void)sec_sign;
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
