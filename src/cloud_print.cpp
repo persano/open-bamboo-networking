@@ -1027,30 +1027,6 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
         rc != 0) return rc;
 
-    // -------------------------------------------------------------
-    // Dispatch signed project_file MQTT command directly to printer.
-    // Bambu Cloud backend dispatches unsigned frames down to the printer,
-    // which firmware rejects with HMS 0500-0500-0001-0007 / err 84033543
-    // when Developer Mode is OFF (Option B). Publishing signed project_file
-    // ensures the printer executes the job immediately under Option B.
-    // -------------------------------------------------------------
-    print_job::ProjectFileOpts pf_opts;
-    pf_opts.file_path  = stored_path;
-    pf_opts.url        = project_url;
-    pf_opts.md5        = md5;
-    pf_opts.project_id = info.project_id;
-    pf_opts.profile_id = info.profile_id;
-    pf_opts.task_id    = task_id;
-    pf_opts.subtask_id = task_id;
-
-    std::string pf_json = print_job::build_project_file_json(p, pf_opts);
-    OBN_INFO("cloud_print dev=%s: publishing signed project_file (task=%s)",
-             p.dev_id.c_str(), task_id.c_str());
-    int pub_rc = send_message(p.dev_id, pf_json, /*qos=*/0);
-    if (pub_rc != 0) {
-        OBN_WARN("cloud_print dev=%s: send_message failed rc=%d; relying on cloud dispatch",
-                 p.dev_id.c_str(), pub_rc);
-    }
 
     print_job::emit_finished_countdown(update_fn, cancel_fn);
     OBN_INFO("cloud_print dev=%s: queued (project=%s task=%s delivery=%s url=%s)",
