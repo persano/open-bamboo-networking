@@ -180,6 +180,9 @@ Response perform(const Request& req)
         curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &req);
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
     }
+    curl_easy_setopt(curl, CURLOPT_BUFFERSIZE,        524288L);   // 512 KiB buffer
+    curl_easy_setopt(curl, CURLOPT_UPLOAD_BUFFERSIZE, 1048576L);  // 1 MiB upload chunk
+    curl_easy_setopt(curl, CURLOPT_TCP_NODELAY,       1L);        // disable Nagle
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       hdrs);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,        10L);
