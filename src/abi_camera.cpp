@@ -35,20 +35,14 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
     // argument (MediaPlayCtrl.cpp / MediaFilePanel.cpp); only the leading
     // serial matters to us.
     const std::string serial = dev_id.substr(0, dev_id.find('|'));
-    const bool force_remote = (dev_id.find("tutk") != std::string::npos ||
-                               dev_id.find("agora") != std::string::npos);
-
     std::string url;
     if (auto* a = as_agent(agent); a && !serial.empty()) {
-        if (!force_remote) {
-            url = a->camera_url_for(serial);
-        }
+        url = a->camera_url_for(serial);
         if (url.empty()) {
             url = a->remote_camera_url(dev_id);
         }
     }
-    OBN_INFO("get_camera_url dev=%s force_remote=%d -> %s", serial.c_str(),
-             force_remote ? 1 : 0,
+    OBN_INFO("get_camera_url dev=%s -> %s", serial.c_str(),
              url.empty() ? "(none)" : (url.find("tutk") != std::string::npos ? "TUTK cloud URL" : "LAN URL"));
     if (callback) callback(std::move(url));
     return BAMBU_NETWORK_SUCCESS;
