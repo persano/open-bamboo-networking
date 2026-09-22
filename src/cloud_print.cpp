@@ -449,6 +449,7 @@ int s3_put(const std::string& url, const std::string& body,
     req.no_default_accept       = true; // don't add our own Accept: application/json
     req.headers["Content-Type"] = "";   // REMOVE libcurl's auto Content-Type
     req.headers["Expect"]       = "";   // REMOVE libcurl's auto Expect: 100-continue
+    req.is_upload               = true; // Use CURLOPT_UPLOAD with 1MB chunk streaming
     req.body      = body;
     // Dynamic timeout: floor of 1800s (30m), plus scale for large files (~10 KB/s budget).
     req.timeout_s = std::max<int>(1800, static_cast<int>(body.size() / 10240));

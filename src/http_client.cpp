@@ -114,6 +114,33 @@ int on_xferinfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
     return 0;
 }
 
+int on_sockopt(void* /*clientp*/, curl_socket_t curlfd, curlsocktype /*purpose*/)
+{
+    // Enlarge socket send buffer to 2 MiB so TCP window scaling can fill the pipe
+    // on high-latency WAN links (e.g. 330ms RTT between South America and Oregon).
+    int sndbuf = 2097152;
+    setsockopt(curlfd, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+    return CURL_SOCKOPT_OK;
+}
+
+struct UploadCtx {
+    const char* ptr;
+    size_t left;
+};
+
+size_t on_upload_read(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+    auto* ctx = static_cast<UploadCtx*>(userdata);
+    size_t max_bytes = size * nitems;
+    size_t to_copy = (std::min)(max_bytes, ctx->left);
+    if (to_copy > 0) {
+        std::memcpy(buffer, ctx->ptr, to_copy);
+        ctx->ptr += to_copy;
+        ctx->left -= to_copy;
+    }
+    return to_copy;
+}
+
 } // namespace
 
 void global_init()
@@ -168,7 +195,7 @@ Response perform(const Request& req)
     }
 
     curl_easy_setopt(curl, CURLOPT_URL,              req.url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,    method_verb(req.method));
+    curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION,  on_sockopt);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   static_cast<long>(req.connect_timeout_s));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,          static_cast<long>(req.timeout_s));
     if (req.low_speed_limit > 0 && req.low_speed_time_s > 0) {
@@ -192,9 +219,18 @@ Response perform(const Request& req)
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION,   on_header);
     curl_easy_setopt(curl, CURLOPT_HEADERDATA,       &resp);
 
-    if (method_has_body) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,          req.body.data());
+    UploadCtx up_ctx{req.body.data(), req.body.size()};
+    if (req.is_upload) {
+        curl_easy_setopt(curl, CURLOPT_UPLOAD,          1L);
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
+        curl_easy_setopt(curl, CURLOPT_READFUNCTION,     on_upload_read);
+        curl_easy_setopt(curl, CURLOPT_READDATA,         &up_ctx);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,    method_verb(req.method));
+        if (method_has_body) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS,          req.body.data());
+        }
     }
 
     // Wire-level tracing of every HTTP request is very useful when

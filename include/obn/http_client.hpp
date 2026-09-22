@@ -53,6 +53,7 @@ struct Request {
     bool                                  no_default_accept       = false;
     int                                   low_speed_limit         = 0;
     int                                   low_speed_time_s        = 0;
+    bool                                  is_upload               = false;
     using ProgressFn = std::function<bool(std::uint64_t dltotal, std::uint64_t dlnow,
                                           std::uint64_t ultotal, std::uint64_t ulnow)>;
     ProgressFn                            progress_cb;
