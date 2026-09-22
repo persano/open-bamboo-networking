@@ -272,6 +272,7 @@ const char* encrypted_field_for(const obn::json::Object& obj)
     const std::string c = cmd->second.as_string();
     if (c == "project_file") return "url";
     if (c == "gcode_line")   return "param";
+    if (c == "prepare")      return "ttcode";
     return nullptr;
 }
 
@@ -388,9 +389,7 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
     if (cmd_val.kind() != obn::json::Value::Kind::Object) return payload_json;
 
     obn::json::Object obj = cmd_val.as_object();
-    if (root_key == "print") {
-        encrypt_print_fields(obj, device_pub, developer_mode);
-    }
+    encrypt_print_fields(obj, device_pub, developer_mode);
     const std::string dump = obn::json::Value(std::move(obj)).dump();
     if (dump.empty()) return payload_json;
 
