@@ -2939,6 +2939,38 @@ int Agent::connect_cloud()
         rescue_cloud_project_file(dev_id, json);
         rescue_cloud_liveview(dev_id, json);
 
+        // Drop rejected unsigned cloud liveview frames from notifying Studio UI
+        if (json.find("\"liveview\"") != std::string::npos &&
+            json.find("84033543") != std::string::npos) {
+            return;
+        }
+
+        // Filter out spurious 65543 (MQTT verification failure caused by cloud prepare) from HMS
+        if (json.find("65543") != std::string::npos &&
+            json.find("\"hms\"") != std::string::npos) {
+            size_t hms_pos = json.find("\"hms\"");
+            size_t arr_start = (hms_pos != std::string::npos) ? json.find('[', hms_pos) : std::string::npos;
+            size_t arr_end = (arr_start != std::string::npos) ? json.find(']', arr_start) : std::string::npos;
+            if (arr_start != std::string::npos && arr_end != std::string::npos) {
+                std::string hms_str = json.substr(arr_start, arr_end - arr_start + 1);
+                auto parsed = obn::json::parse(hms_str);
+                if (parsed && parsed->is_array()) {
+                    obn::json::Array filtered_hms;
+                    for (const auto& item : parsed->as_array()) {
+                        if (item.is_object()) {
+                            auto code_val = item.find("code");
+                            if (code_val.is_number() && code_val.as_int() == 65543) {
+                                continue;
+                            }
+                        }
+                        filtered_hms.push_back(item);
+                    }
+                    std::string new_hms = obn::json::Value(std::move(filtered_hms)).dump();
+                    json.replace(arr_start, arr_end - arr_start + 1, new_hms);
+                }
+            }
+        }
+
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
         // notification so Studio moves the device from "subscribing"
@@ -2948,6 +2980,11 @@ int Agent::connect_cloud()
         {
             std::lock_guard<std::mutex> lk(mu_);
             first = cloud_connected_devs_.insert(dev_id).second;
+        }
+        if (first) {
+            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
+            cloud_send_message(dev_id, pushall, 0);
+            OBN_INFO("cloud on_msg_cb: first message for dev=%s, dispatched proactive pushall", dev_id.c_str());
         }
         if (first && on_printer_connected) {
             BBL::OnPrinterConnectedFn cb = on_printer_connected;
@@ -3056,8 +3093,15 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         OBN_WARN("cloud_add_subscribe: no active cloud session");
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
-    if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
-    return sess->add_subscribe(filtered);
+    int rc = sess->add_subscribe(filtered);
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        for (const auto& d : filtered) {
+            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
+            cloud_send_message(d, pushall, 0);
+            OBN_INFO("cloud_add_subscribe: dispatched proactive pushall to dev=%s", d.c_str());
+        }
+    }
+    return rc;
 }
 
 int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
