@@ -44,7 +44,7 @@ OBN_ABI int bambu_network_get_camera_url(void* agent,
             url = a->camera_url_for(serial);
         }
         if (url.empty()) {
-            url = a->remote_camera_url(serial);
+            url = a->remote_camera_url(dev_id);
         }
     }
     OBN_INFO("get_camera_url dev=%s force_remote=%d -> %s", serial.c_str(),

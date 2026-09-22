@@ -1524,10 +1524,55 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         hdrs["X-BBL-Client-ID"] = "slicer:" + s.user_id + ":obn0";
 
     std::string serial = dev_id;
-    const auto bar = serial.find('|');
-    if (bar != std::string::npos) serial = serial.substr(0, bar);
-    const std::string req_body = std::string("{\"dev_id\":")
-                               + obn::json::escape(serial) + "}";
+    std::string dev_version;
+    std::string protocols_spec;
+
+    const auto b1 = serial.find('|');
+    if (b1 != std::string::npos) {
+        const auto b2 = serial.find('|', b1 + 1);
+        dev_version = serial.substr(b1 + 1, b2 == std::string::npos ? std::string::npos : b2 - (b1 + 1));
+        if (b2 != std::string::npos) {
+            const auto b3 = serial.find('|', b2 + 1);
+            protocols_spec = serial.substr(b2 + 1, b3 == std::string::npos ? std::string::npos : b3 - (b2 + 1));
+        }
+        serial = serial.substr(0, b1);
+    }
+
+    if (dev_version.empty()) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = device_fw_.find(serial);
+        if (it != device_fw_.end()) {
+            auto ota = it->second.modules.find("ota");
+            if (ota != it->second.modules.end()) {
+                dev_version = ota->second.cur_ver;
+            }
+        }
+    }
+
+    std::vector<std::string> protos;
+    if (protocols_spec.find("tutk") != std::string::npos)  protos.push_back("\"tutk\"");
+    if (protocols_spec.find("agora") != std::string::npos) protos.push_back("\"agora\"");
+    if (protos.empty()) {
+        protos.push_back("\"tutk\"");
+        protos.push_back("\"agora\"");
+    }
+
+    std::string protos_json = "[";
+    for (size_t i = 0; i < protos.size(); ++i) {
+        if (i > 0) protos_json += ",";
+        protos_json += protos[i];
+    }
+    protos_json += "]";
+
+    std::string req_body = "{\"dev_id\":" + obn::json::escape(serial);
+    if (!dev_version.empty()) {
+        req_body += ",\"dev_version\":" + obn::json::escape(dev_version);
+    }
+    req_body += ",\"protocols\":" + protos_json + "}";
+
+    OBN_INFO("camera_url(remote): request dev=%s ver=%s protos=%s",
+             serial.c_str(), dev_version.c_str(), protos_json.c_str());
+
     obn::http::Response resp = obn::http::post_json(url, req_body, hdrs);
     OBN_INFO("camera_url(remote): ttcode POST http=%ld body=%.700s",
              resp.status_code, resp.body.c_str());
@@ -1558,7 +1603,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
             for (const auto& d : arr.as_array()) {
                 std::string did = get(d, "dev_id");
                 if (did.empty()) did = get(d, "device");
-                if (!dev_id.empty() && !did.empty() && did != dev_id) continue;
+                if (!serial.empty() && !did.empty() && did != serial) continue;
                 std::string u = get(d, "ttcode");
                 if (u.empty()) u = get(d, "uid");
                 if (u.empty()) continue;
@@ -1573,7 +1618,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     }
 
     if (uid.empty()) {
-        OBN_WARN("camera_url(remote): no ttcode/uid for dev=%s in response", dev_id.c_str());
+        OBN_WARN("camera_url(remote): no ttcode/uid for dev=%s in response", serial.c_str());
         return {};
     }
 
@@ -1586,8 +1631,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     if (region.empty()) region = "us";
 
     std::string turl = "bambu:///tutk?uid=" + uid + "&authkey=" + authkey
-                     + "&passwd=" + passwd + "&region=" + region
-                     + "&device=" + serial;
+                     + "&passwd=" + passwd + "&region=" + region;
     OBN_INFO("camera_url(remote): built tutk url for dev=%s uid=%.20s region=%s",
              serial.c_str(), uid.c_str(), region.c_str());
     return turl;
