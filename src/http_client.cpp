@@ -99,6 +99,21 @@ const char* method_verb(Method m)
     return "GET";
 }
 
+int on_xferinfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
+                curl_off_t ultotal, curl_off_t ulnow)
+{
+    auto* req = static_cast<const Request*>(clientp);
+    if (req && req->progress_cb) {
+        bool ok = req->progress_cb(
+            static_cast<std::uint64_t>(dltotal > 0 ? dltotal : 0),
+            static_cast<std::uint64_t>(dlnow > 0 ? dlnow : 0),
+            static_cast<std::uint64_t>(ultotal > 0 ? ultotal : 0),
+            static_cast<std::uint64_t>(ulnow > 0 ? ulnow : 0));
+        if (!ok) return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 void global_init()
@@ -156,6 +171,15 @@ Response perform(const Request& req)
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST,    method_verb(req.method));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,   static_cast<long>(req.connect_timeout_s));
     curl_easy_setopt(curl, CURLOPT_TIMEOUT,          static_cast<long>(req.timeout_s));
+    if (req.low_speed_limit > 0 && req.low_speed_time_s > 0) {
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, static_cast<long>(req.low_speed_limit));
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME,  static_cast<long>(req.low_speed_time_s));
+    }
+    if (req.progress_cb) {
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, on_xferinfo);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA,     &req);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS,       0L);
+    }
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       hdrs);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION,   1L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS,        10L);
@@ -166,8 +190,8 @@ Response perform(const Request& req)
     curl_easy_setopt(curl, CURLOPT_HEADERDATA,       &resp);
 
     if (method_has_body) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(req.body.size()));
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    req.body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(req.body.size()));
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,          req.body.data());
     }
 
     // Wire-level tracing of every HTTP request is very useful when

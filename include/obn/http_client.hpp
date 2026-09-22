@@ -19,6 +19,7 @@
 //     helper in `json_lite.hpp`).
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -50,6 +51,11 @@ struct Request {
     // yields SignatureDoesNotMatch.
     bool                                  no_default_content_type = false;
     bool                                  no_default_accept       = false;
+    int                                   low_speed_limit         = 0;
+    int                                   low_speed_time_s        = 0;
+    using ProgressFn = std::function<bool(std::uint64_t dltotal, std::uint64_t dlnow,
+                                          std::uint64_t ultotal, std::uint64_t ulnow)>;
+    ProgressFn                            progress_cb;
 };
 
 // Process-wide libcurl init (idempotent). Safe to call repeatedly.

@@ -348,7 +348,15 @@ int fail_stage(BBL::OnUpdateStatusFn update_fn, int code, const std::string& wha
     else if (resp.status_code != 0)
         detail += ": HTTP " + std::to_string(resp.status_code);
     OBN_ERROR("cloud_print: %s (body=%.2000s)", detail.c_str(), resp.body.c_str());
-    if (update_fn) update_fn(BBL::PrintingStageERROR, code, detail);
+    if (update_fn) {
+        try {
+            update_fn(BBL::PrintingStageERROR, code, detail);
+        } catch (const std::exception& e) {
+            OBN_WARN("cloud_print: update_fn threw: %s", e.what());
+        } catch (...) {
+            OBN_WARN("cloud_print: update_fn threw unknown exception");
+        }
+    }
     return code;
 }
 
@@ -421,8 +429,6 @@ int s3_put(const std::string& url, const std::string& body,
            int                   progress_stage,
            int                   err_code)
 {
-    (void)cancel_fn; // libcurl synchronous path: we observe cancel on the
-                     // next major step boundary.
     obn::http::Request req;
     req.method  = obn::http::Method::PUT;
     req.url     = url;
@@ -444,15 +450,41 @@ int s3_put(const std::string& url, const std::string& body,
     req.headers["Content-Type"] = "";   // REMOVE libcurl's auto Content-Type
     req.headers["Expect"]       = "";   // REMOVE libcurl's auto Expect: 100-continue
     req.body      = body;
-    req.timeout_s = 120;
+    // Dynamic timeout: floor of 1800s (30m), plus scale for large files (~10 KB/s budget).
+    req.timeout_s = std::max<int>(1800, static_cast<int>(body.size() / 10240));
+    // Abort if transfer stalls below 1 KB/s for 60 consecutive seconds.
+    req.low_speed_limit  = 1024;
+    req.low_speed_time_s = 60;
 
     const auto total = static_cast<std::uint64_t>(body.size());
     if (update_fn)
         update_fn(progress_stage, 0, print_job::format_upload_info(0, total));
 
+    int last_pct = -1;
+    req.progress_cb = [&](std::uint64_t /*dltotal*/, std::uint64_t /*dlnow*/,
+                          std::uint64_t ultotal, std::uint64_t ulnow) -> bool {
+        if (cancel_fn && cancel_fn())
+            return false;
+        if (update_fn && ultotal > 0) {
+            int pct = static_cast<int>((ulnow * 100) / ultotal);
+            if (pct != last_pct) {
+                last_pct = pct;
+                try {
+                    update_fn(progress_stage, pct, print_job::format_upload_info(ulnow, ultotal));
+                } catch (...) {}
+            }
+        }
+        return true;
+    };
+
     auto resp = obn::http::perform(req);
-    if (!resp.error.empty() || !status_ok(resp.status_code))
+    if (!resp.error.empty() || !status_ok(resp.status_code)) {
+        if (cancel_fn && cancel_fn()) {
+            OBN_WARN("cloud_print: s3 PUT canceled by user");
+            return BAMBU_NETWORK_ERR_CANCELED;
+        }
         return fail_stage(update_fn, err_code, "s3 PUT", resp);
+    }
 
     OBN_DEBUG("cloud_print: s3 PUT ok http=%ld bytes=%zu url=%s",
               resp.status_code, body.size(), redact_url(url).c_str());
