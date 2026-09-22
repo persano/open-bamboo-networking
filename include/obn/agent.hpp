@@ -601,6 +601,7 @@ private:
     // Prevents duplicate rescues when both LAN and cloud report arrive.
     // Guarded by mu_.
     std::set<std::string> rescued_tasks_;
+    std::set<std::string> rescued_liveviews_;
 
     // Intercepts a Bambu Cloud unsigned project_file rejection (err_code
     // 84033543 / HMS 0500-0500-0001-0007) and re-publishes it signed+encrypted
@@ -609,6 +610,12 @@ private:
     // No-op when: key unavailable, err_code != 84033543, already rescued.
     void rescue_cloud_project_file(const std::string& dev_id,
                                    const std::string& json);
+
+    // Intercepts a Bambu Cloud unsigned liveview prepare rejection (err_code
+    // 84033543 / HMS 0500-0500-0001-0007) and re-publishes it signed via
+    // send_message so the printer accepts it under Option B (Dev Mode OFF).
+    void rescue_cloud_liveview(const std::string& dev_id,
+                               const std::string& json);
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.

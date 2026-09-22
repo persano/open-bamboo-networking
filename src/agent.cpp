@@ -1276,6 +1276,73 @@ void Agent::rescue_cloud_project_file(const std::string& dev_id,
     }).detach();
 }
 
+void Agent::rescue_cloud_liveview(const std::string& dev_id,
+                                  const std::string& json)
+{
+    if (json.find("\"liveview\"") == std::string::npos) return;
+    if (json.find("\"prepare\"") == std::string::npos) return;
+    if (json.find("84033543") == std::string::npos) return;
+
+    auto root = obn::json::parse(json);
+    if (!root) return;
+    const obn::json::Value& lv_val = root->find("liveview");
+    if (lv_val.kind() != obn::json::Value::Kind::Object) return;
+
+    obn::json::Object lv_obj = lv_val.as_object();
+
+    auto cmd_it = lv_obj.find("command");
+    if (cmd_it == lv_obj.end() || !cmd_it->second.is_string()) return;
+    if (cmd_it->second.as_string() != "prepare") return;
+
+    auto err_it = lv_obj.find("err_code");
+    if (err_it == lv_obj.end()) return;
+    {
+        bool is_rejection = false;
+        if (err_it->second.is_number()) {
+            is_rejection = (err_it->second.as_int() == 84033543LL);
+        }
+        if (!is_rejection) return;
+    }
+
+    std::string ttcode;
+    auto tt_it = lv_obj.find("ttcode");
+    if (tt_it != lv_obj.end() && tt_it->second.is_string())
+        ttcode = tt_it->second.as_string();
+
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!ttcode.empty()) {
+            if (!rescued_liveviews_.insert(ttcode).second) {
+                OBN_DEBUG("rescue_cloud_liveview dev=%s ttcode=%s: already rescued, skip",
+                          dev_id.c_str(), ttcode.c_str());
+                return;
+            }
+        }
+    }
+
+    OBN_INFO("rescue_cloud_liveview dev=%s ttcode=%s: intercepting unsigned rejection, signing and republishing",
+             dev_id.c_str(), ttcode.c_str());
+
+    lv_obj.erase("err_code");
+    lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+
+    obn::json::Object new_root;
+    new_root["liveview"] = obn::json::Value(std::move(lv_obj));
+    const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+    std::string dev_id_copy = dev_id;
+    std::thread([this, dev_id_copy, req_json]() mutable {
+        int rc = send_message(dev_id_copy, req_json, /*qos=*/0);
+        if (rc == BAMBU_NETWORK_SUCCESS) {
+            OBN_INFO("rescue_cloud_liveview dev=%s: signed liveview prepare dispatched OK",
+                     dev_id_copy.c_str());
+        } else {
+            OBN_WARN("rescue_cloud_liveview dev=%s: send_message failed rc=%d",
+                     dev_id_copy.c_str(), rc);
+        }
+    }).detach();
+}
+
 int Agent::send_message_to_printer(const std::string& dev_id,
                                    const std::string& json_str,
                                    int                qos)
@@ -1630,6 +1697,35 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
     }
     if (region.empty()) region = "us";
 
+    // Proactively send signed prepare command so printer starts tutk_server
+    {
+        obn::json::Object lv_obj;
+        lv_obj["command"]     = obn::json::Value(std::string("prepare"));
+        lv_obj["sequence_id"] = obn::json::Value(obn::next_mqtt_seq_id());
+        lv_obj["ttcode"]      = obn::json::Value(uid);
+        lv_obj["authkey"]     = obn::json::Value(authkey);
+        lv_obj["passwd"]      = obn::json::Value(passwd);
+        lv_obj["region"]      = obn::json::Value(region);
+
+        obn::json::Object new_root;
+        new_root["liveview"] = obn::json::Value(std::move(lv_obj));
+        const std::string req_json = obn::json::Value(std::move(new_root)).dump();
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            rescued_liveviews_.insert(uid);
+        }
+
+        OBN_INFO("camera_url(remote): proactively dispatching signed liveview prepare for dev=%s uid=%s",
+                 serial.c_str(), uid.c_str());
+        std::string s_copy = serial;
+        std::thread([this, s_copy, req_json]() mutable {
+            int rc = send_message(s_copy, req_json, /*qos=*/0);
+            OBN_INFO("camera_url(remote): proactive liveview prepare dev=%s rc=%d",
+                     s_copy.c_str(), rc);
+        }).detach();
+    }
+
     std::string turl = "bambu:///tutk?uid=" + uid + "&authkey=" + authkey
                      + "&passwd=" + passwd + "&region=" + region;
     OBN_INFO("camera_url(remote): built tutk url for dev=%s uid=%.20s region=%s",
@@ -1677,6 +1773,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
     harvest_developer_mode(dev_id, json);
     harvest_media_caps(dev_id, json);
     rescue_cloud_project_file(dev_id, json);
+    rescue_cloud_liveview(dev_id, json);
 
     // LAN telemetry is authoritative: stamp the report and, on the first one,
     // defer-close the cloud report subscription for this device.
@@ -2840,6 +2937,7 @@ int Agent::connect_cloud()
         harvest_developer_mode(dev_id, json);
         harvest_media_caps(dev_id, json);
         rescue_cloud_project_file(dev_id, json);
+        rescue_cloud_liveview(dev_id, json);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
@@ -2992,10 +3090,17 @@ int Agent::cloud_send_message(const std::string& dev_id,
         return BAMBU_NETWORK_ERR_SEND_MSG_FAILED;
     }
 
+    const bool sign = obn::signing::would_sign(json_str);
+    if (sign)
+        wait_for_app_cert(dev_id, std::chrono::seconds(8));
+
     EVP_PKEY* dev_pub = cert_store::get_printer_pub_key(dev_id);
     std::string signed_json =
         obn::signing::maybe_sign(json_str, dev_pub, developer_mode_effective(dev_id));
     if (dev_pub) EVP_PKEY_free(dev_pub);
+    if (sign)
+        OBN_DEBUG("CLOUD SIGNED-ENVELOPE dev=%s bytes=%zu json=%s",
+                  dev_id.c_str(), signed_json.size(), signed_json.c_str());
     return sess->publish(dev_id, signed_json, qos);
 }
 
