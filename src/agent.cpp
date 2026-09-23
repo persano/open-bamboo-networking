@@ -82,6 +82,35 @@ std::string ipv4_from_le_int(std::int64_t v)
            std::to_string((v >> 16) & 0xFF) + "." + std::to_string((v >> 24) & 0xFF);
 }
 
+void filter_hms_code(std::string& json, int target_code)
+{
+    if (json.find(std::to_string(target_code)) == std::string::npos ||
+        json.find("\"hms\"") == std::string::npos) {
+        return;
+    }
+    size_t hms_pos = json.find("\"hms\"");
+    size_t arr_start = (hms_pos != std::string::npos) ? json.find('[', hms_pos) : std::string::npos;
+    size_t arr_end = (arr_start != std::string::npos) ? json.find(']', arr_start) : std::string::npos;
+    if (arr_start != std::string::npos && arr_end != std::string::npos) {
+        std::string hms_str = json.substr(arr_start, arr_end - arr_start + 1);
+        auto parsed = obn::json::parse(hms_str);
+        if (parsed && parsed->is_array()) {
+            obn::json::Array filtered_hms;
+            for (const auto& item : parsed->as_array()) {
+                if (item.is_object()) {
+                    auto code_val = item.find("code");
+                    if (code_val.is_number() && code_val.as_int() == target_code) {
+                        continue;
+                    }
+                }
+                filtered_hms.push_back(item);
+            }
+            std::string new_hms = obn::json::Value(std::move(filtered_hms)).dump();
+            json.replace(arr_start, arr_end - arr_start + 1, new_hms);
+        }
+    }
+}
+
 } // namespace
 
 static std::atomic<Agent*> s_active_agent{nullptr};
@@ -467,15 +496,12 @@ void Agent::maybe_prefer_lan_subscription(const std::string& dev_id)
     }
     if (!newly_deferred) return;
 
-    // LAN telemetry is now authoritative. Defer-close the cloud report
-    // subscription (unsubscribe only; the cloud MQTT stays connected so command
-    // publishing and failback remain instant). Under block_cloud there is no
-    // cloud subscription to close.
-    if (!obn::config::current().block_cloud) {
-        OBN_INFO("lan-priority: LAN telemetry active for dev=%s; "
-                 "defer-closing cloud report subscription", dev_id.c_str());
-        cloud_del_subscribe({dev_id});
-    }
+    // LAN telemetry is now authoritative for local UI, but we KEEP the
+    // cloud report subscription active so that Option B cloud print rescue
+    // (intercepting unsigned cloud dispatch 84033543) and cloud liveview
+    // continue to receive broker messages without interruption.
+    OBN_INFO("lan-priority: LAN telemetry active for dev=%s; "
+             "keeping cloud report subscription active for Option B rescue", dev_id.c_str());
     ensure_lan_watchdog_running();
 }
 
@@ -1911,6 +1937,9 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         update_fw_state(&fw_state_for(dev_id), patched);
     }
 
+    // Suppress spurious 65543 (MQTT verification failure) from triggering Studio HMS banner
+    filter_hms_code(patched, 65543);
+
     if (cb) cb(dev_id, patched);
 }
 
@@ -2939,37 +2968,15 @@ int Agent::connect_cloud()
         rescue_cloud_project_file(dev_id, json);
         rescue_cloud_liveview(dev_id, json);
 
-        // Drop rejected unsigned cloud liveview frames from notifying Studio UI
-        if (json.find("\"liveview\"") != std::string::npos &&
+        // Drop rejected unsigned cloud frames from notifying Studio UI
+        if ((json.find("\"liveview\"") != std::string::npos ||
+             json.find("\"project_file\"") != std::string::npos) &&
             json.find("84033543") != std::string::npos) {
             return;
         }
 
-        // Filter out spurious 65543 (MQTT verification failure caused by cloud prepare) from HMS
-        if (json.find("65543") != std::string::npos &&
-            json.find("\"hms\"") != std::string::npos) {
-            size_t hms_pos = json.find("\"hms\"");
-            size_t arr_start = (hms_pos != std::string::npos) ? json.find('[', hms_pos) : std::string::npos;
-            size_t arr_end = (arr_start != std::string::npos) ? json.find(']', arr_start) : std::string::npos;
-            if (arr_start != std::string::npos && arr_end != std::string::npos) {
-                std::string hms_str = json.substr(arr_start, arr_end - arr_start + 1);
-                auto parsed = obn::json::parse(hms_str);
-                if (parsed && parsed->is_array()) {
-                    obn::json::Array filtered_hms;
-                    for (const auto& item : parsed->as_array()) {
-                        if (item.is_object()) {
-                            auto code_val = item.find("code");
-                            if (code_val.is_number() && code_val.as_int() == 65543) {
-                                continue;
-                            }
-                        }
-                        filtered_hms.push_back(item);
-                    }
-                    std::string new_hms = obn::json::Value(std::move(filtered_hms)).dump();
-                    json.replace(arr_start, arr_end - arr_start + 1, new_hms);
-                }
-            }
-        }
+        // Filter out spurious 65543 (MQTT verification failure caused by cloud prepare / project_file) from HMS
+        filter_hms_code(json, 65543);
 
         // Mirror Bambu's plugin: the FIRST cloud report we receive
         // for a device kicks off an on_printer_connected("tunnel/<id>")
@@ -2996,6 +3003,18 @@ int Agent::connect_cloud()
             auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
             if (q) q(invoke); else invoke();
         }
+
+        // If LAN telemetry is active, do not forward routine push_status to on_msg
+        // to avoid duplicate UI updates, but forward all other frames.
+        bool lan_active = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            lan_active = (lan_report_priority_.count(dev_id) != 0);
+        }
+        if (lan_active && json.find("\"command\":\"push_status\"") != std::string::npos) {
+            return;
+        }
+
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
 
@@ -3076,16 +3095,9 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
     {
         std::lock_guard<std::mutex> lk(mu_);
         sess = cloud_session_.get();
-        // Skip devices currently covered by LAN telemetry (LAN-priority): the
-        // cloud report subscription for them is intentionally deferred. The
-        // failback path clears the device from lan_report_priority_ before
-        // calling here, so re-subscription still works.
+        // Do not skip devices under LAN priority: cloud subscription
+        // is required for Option B cloud print rescue (84033543 interception).
         for (const auto& d : dev_ids) {
-            if (lan_report_priority_.count(d)) {
-                OBN_DEBUG("cloud_add_subscribe: dev=%s under LAN priority, "
-                          "skipping cloud report subscription", d.c_str());
-                continue;
-            }
             filtered.push_back(d);
         }
     }
