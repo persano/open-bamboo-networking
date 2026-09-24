@@ -54,8 +54,10 @@ elseif ($Action -eq "deploy") {
         if (-not (Test-Path $t)) {
             New-Item -ItemType Directory -Path $t -Force | Out-Null
         }
-        Copy-Item -Path $bambuSrc -Destination $t -Force
-        Copy-Item -Path $bambuNet -Destination $t -Force
+        Copy-Item -Path $bambuSrc -Destination (Join-Path $t "BambuSource.dll") -Force
+        Copy-Item -Path $bambuNet -Destination (Join-Path $t "bambu_networking.dll") -Force
+        Copy-Item -Path $bambuNet -Destination (Join-Path $t "bambu_networking_02.08.01.99.dll") -Force
+        Copy-Item -Path $bambuNet -Destination (Join-Path $t "bambu_networking_02.08.01.dll") -Force
         Write-Host "Deployed to $t"
     }
 
