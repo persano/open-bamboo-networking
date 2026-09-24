@@ -1337,13 +1337,15 @@ void Agent::rescue_cloud_liveview(const std::string& dev_id,
 
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (!ttcode.empty()) {
-            if (!rescued_liveviews_.insert(ttcode).second) {
-                OBN_DEBUG("rescue_cloud_liveview dev=%s ttcode=%s: already rescued, skip",
-                          dev_id.c_str(), ttcode.c_str());
-                return;
-            }
+        static std::map<std::string, std::chrono::steady_clock::time_point> last_rescue;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = last_rescue.find(dev_id);
+        if (it != last_rescue.end() && now - it->second < std::chrono::seconds(2)) {
+            OBN_DEBUG("rescue_cloud_liveview dev=%s: rescue cooldown active (2s), skip duplicate",
+                      dev_id.c_str());
+            return;
         }
+        last_rescue[dev_id] = now;
     }
 
     OBN_INFO("rescue_cloud_liveview dev=%s ttcode=%s: intercepting unsigned rejection, signing and republishing",
@@ -1736,7 +1738,7 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(prep_mu);
         auto it = last_prepare.find(uid);
-        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(12)) {
+        if (it != last_prepare.end() && now - it->second < std::chrono::seconds(3)) {
             prepare_recently = true;
         } else {
             last_prepare[uid] = now;
@@ -1757,11 +1759,6 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
         obn::json::Object new_root;
         new_root["liveview"] = obn::json::Value(std::move(lv_obj));
         const std::string req_json = obn::json::Value(std::move(new_root)).dump();
-
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            rescued_liveviews_.insert(uid);
-        }
 
         OBN_INFO("camera_url(remote): proactively dispatching signed liveview prepare for dev=%s uid=%s",
                  serial.c_str(), uid.c_str());
