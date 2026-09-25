@@ -1059,35 +1059,55 @@ void Agent::harvest_security_report(const std::string& dev_id,
         }
         // Persist full PEM chain like Studio's certs/<serial>.pem.
         const std::string cfg_dir = config_dir();
+        std::string       out_path;
+        bool              cert_on_disk = false;
         if (!cfg_dir.empty()) {
-            const std::string out_path =
-                cert_store::device_cert_path(cfg_dir, dev_id);
-            if (cert_store::ensure_parent_dir(out_path)) {
+            out_path = cert_store::device_cert_path(cfg_dir, dev_id);
+            std::string reason;
+            if (!cert_store::ensure_parent_dir(out_path)) {
+                reason = "cannot create the certs directory";
+            } else {
                 const std::string tmp_path = out_path + ".tmp";
                 std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
                 if (ofs) {
                     ofs << printer_cert;
                     ofs.close();
+                }
+                // Swap into place only after a complete write: renaming a
+                // truncated PEM over the previous cert would leave an
+                // unparseable file there for good, and the rename itself can
+                // fail (on Windows a reader holding the destination open is
+                // enough).
+                if (!ofs) {
+                    reason = "write failed";
+                } else {
                     std::error_code ec;
                     std::filesystem::rename(tmp_path, out_path, ec);
-                    if (ec) {
-                        std::filesystem::remove(tmp_path, ec);
-                    }
-                    std::string ip;
-                    {
-                        std::lock_guard<std::mutex> lk(mu_);
-                        if (lan_session_ && lan_session_->dev_id() == dev_id)
-                            ip = lan_session_->dev_ip();
-                        certified_devs_.insert(dev_id);
-                    }
-                    if (!ip.empty())
-                        obn::lan_tls::registry_set_peer_cert(ip, out_path);
+                    cert_on_disk = !ec;
+                    if (ec) reason = ec.message();
+                }
+                if (!cert_on_disk) {
+                    std::error_code rm_ec;
+                    std::filesystem::remove(tmp_path, rm_ec);
                 }
             }
-        } else {
+            if (!cert_on_disk) {
+                OBN_WARN("app_cert_install dev=%s: could not persist device cert "
+                         "to %s (%s); continuing with the in-memory pubkey only",
+                         dev_id.c_str(), out_path.c_str(), reason.c_str());
+            }
+        }
+        // The install itself succeeded and the pubkey is cached, so the device
+        // counts as certified either way; only the on-disk pin needs the file.
+        std::string ip;
+        {
             std::lock_guard<std::mutex> lk(mu_);
             certified_devs_.insert(dev_id);
+            if (cert_on_disk && lan_session_ && lan_session_->dev_id() == dev_id)
+                ip = lan_session_->dev_ip();
         }
+        if (!ip.empty())
+            obn::lan_tls::registry_set_peer_cert(ip, out_path);
         // Latch only after a successful printer reply (not at publish time),
         // so a lost/failed install can be retried on the next Studio tick.
         {
@@ -2989,7 +3009,7 @@ int Agent::connect_cloud()
     // registered. The message callback is intentionally NOT queued:
     // DeviceManager::on_push_message() is thread-aware and has its own
     // fast-path handling.
-    auto on_connected_cb = [this, on_server, queue, on_printer_connected]
+    auto on_connected_cb = [this, on_server, queue]
         (int status, int reason, std::string /*msg*/)
     {
         OBN_INFO("cloud: server_connected status=%d reason=%d", status, reason);
@@ -2999,28 +3019,23 @@ int Agent::connect_cloud()
             };
             if (queue) queue(invoke); else invoke();
         }
-        // On successful CONNACK, if we already know the user's device
-        // list (passed via add_subscribe earlier), fire
-        // on_printer_connected with a "tunnel/" prefix for each of
-        // them so Studio marks them cloud-online and requests pushall.
-        if (status == 0 && on_printer_connected) {
-            std::vector<std::string> devs;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (cloud_session_) {
-                    // CloudSession exposes is_connected() only; mirror
-                    // its subscribed set via our own copy -> we don't
-                    // duplicate the state here. Instead: we rely on
-                    // Studio calling add_subscribe right after
-                    // connect_server, which will then call this path
-                    // via the sub-success logic below.
-                }
-            }
-            (void)devs;
+        // CONNACK re-applies the whole subscription set, so this is where the
+        // devices Studio handed us before the connection came up become
+        // reachable. Ask them for a snapshot; on_printer_connected stays
+        // report-driven, so we never claim a powered-off printer is online.
+        if (status == 0) {
+            kickstart_cloud_status();
+        } else {
+            // A transport drop invalidates the broker-side subscriptions
+            // (CloudSession clears active_ too), and the status we hold may be
+            // minutes stale by the time we are back, so bootstrap again on the
+            // next CONNACK.
+            std::lock_guard<std::mutex> lk(mu_);
+            cloud_kickstarted_devs_.clear();
         }
     };
 
-    auto on_msg_cb = [this, on_msg, on_printer_connected]
+    auto on_msg_cb = [this, on_msg]
         (std::string dev_id, std::string json)
     {
         harvest_security_report(dev_id, json);
@@ -3046,25 +3061,38 @@ int Agent::connect_cloud()
         // notification so Studio moves the device from "subscribing"
         // to "online" in its UI. App-cert provisioning is Studio-driven
         // via bambu_network_install_device_cert (not eager on report).
-        bool first = false;
+        //
+        // Both slicers answer that notification with pushall
+        // (GUI_App::init_networking_callbacks -> command_request_push_all),
+        // which is what fills the device panel — AMS trays, temperatures,
+        // job state. Losing it leaves that panel empty until something else
+        // asks, so read the callback *fresh* here instead of using the
+        // snapshot taken when connect_cloud() ran: Studio may register it
+        // after connect_server, and a stale null capture would stay null for
+        // the whole session. For the same reason the notification latch is
+        // separate from the seen-this-session set — a report that arrives
+        // before the callback exists must not swallow the notification.
+        bool                      first_report = false;
+        bool                      notify       = false;
+        BBL::OnPrinterConnectedFn printer_connected_cb;
+        BBL::QueueOnMainFn        q;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            first = cloud_connected_devs_.insert(dev_id).second;
+            first_report         = cloud_connected_devs_.insert(dev_id).second;
+            printer_connected_cb = on_printer_connected_;
+            q                    = queue_on_main_;
+            if (printer_connected_cb)
+                notify = cloud_notified_devs_.insert(dev_id).second;
         }
-        if (first) {
-            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
-            cloud_send_message(dev_id, pushall, 0);
-            OBN_INFO("cloud on_msg_cb: first message for dev=%s, dispatched proactive pushall", dev_id.c_str());
-        }
-        if (first && on_printer_connected) {
-            BBL::OnPrinterConnectedFn cb = on_printer_connected;
-            BBL::QueueOnMainFn        q;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                q = queue_on_main_;
-            }
-            auto invoke = [cb, dev_id]() { cb("tunnel/" + dev_id); };
+        if (notify) {
+            auto invoke = [printer_connected_cb, dev_id]() {
+                printer_connected_cb("tunnel/" + dev_id);
+            };
             if (q) q(invoke); else invoke();
+        } else if (first_report && !printer_connected_cb) {
+            OBN_DEBUG("cloud: first report for dev=%s arrived before Studio "
+                      "registered on_printer_connected; will notify on a "
+                      "later report", dev_id.c_str());
         }
 
         // If LAN telemetry is active, do not forward routine push_status to on_msg
@@ -3105,6 +3133,8 @@ int Agent::disconnect_cloud()
         std::lock_guard<std::mutex> lk(mu_);
         sess = std::move(cloud_session_);
         devs.swap(cloud_connected_devs_);
+        cloud_notified_devs_.clear();
+        cloud_kickstarted_devs_.clear();
         if (lan_session_) lan_dev = lan_session_->dev_id();
         // Drop install latches for everything except an active LAN session
         // (that session still owns its once-per-session install).
@@ -3168,14 +3198,13 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
         OBN_WARN("cloud_add_subscribe: no active cloud session");
         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
     }
+    if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
     int rc = sess->add_subscribe(filtered);
-    if (rc == BAMBU_NETWORK_SUCCESS) {
-        for (const auto& d : filtered) {
-            std::string pushall = "{\"pushing\":{\"command\":\"pushall\",\"sequence_id\":\"0\",\"version\":1}}";
-            cloud_send_message(d, pushall, 0);
-            OBN_INFO("cloud_add_subscribe: dispatched proactive pushall to dev=%s", d.c_str());
-        }
-    }
+    // Covers the other ordering: Studio subscribes on an already-connected
+    // session (device list refresh, LAN failback, multi-device page). When it
+    // subscribes before CONNACK instead, add_subscribe only records the set and
+    // the CONNACK path does the kickstart.
+    if (rc == BAMBU_NETWORK_SUCCESS) kickstart_cloud_status();
     return rc;
 }
 
@@ -3187,11 +3216,57 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
         sess = cloud_session_.get();
         for (const auto& d : dev_ids) {
             cloud_connected_devs_.erase(d);
+            cloud_notified_devs_.erase(d);
+            cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
         }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;
     return sess->del_subscribe(dev_ids);
+}
+
+// Stock kickstart shape (research/06.02 + research/12.01): constant
+// sequence_id "0" — the 20000-29999 window is Studio's, not the plugin's —
+// plus version and push_target, both 1.
+static constexpr char kPushallRequest[] =
+    R"({"pushing":{"sequence_id":"0","command":"pushall","version":1,"push_target":1}})";
+
+void Agent::kickstart_cloud_status()
+{
+    if (!obn::config::current().cloud_pushall_on_connect) return;
+
+    CloudSession* sess = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        sess = cloud_session_.get();
+    }
+    // Only bootstrap devices whose report subscription is already live: a
+    // reply to a topic nobody listens on is lost, which is exactly the trap
+    // of publishing straight after add_subscribe (that runs before CONNACK).
+    if (!sess || !sess->is_connected()) return;
+
+    // Queried before taking mu_ so the two mutexes are never nested.
+    const std::vector<std::string> active = sess->active_devices();
+    std::vector<std::string>       pending;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& d : active) {
+            if (cloud_kickstarted_devs_.insert(d).second) pending.push_back(d);
+        }
+    }
+    for (const auto& d : pending) {
+        int rc = cloud_send_message(d, kPushallRequest, /*qos=*/0);
+        if (rc == BAMBU_NETWORK_SUCCESS) {
+            OBN_INFO("cloud: pushall kickstart sent to %s", d.c_str());
+        } else {
+            // Most likely a disconnect racing us. Un-latch so the next
+            // CONNACK or subscribe retries instead of leaving the device
+            // waiting for telemetry that may never come.
+            OBN_WARN("cloud: pushall kickstart to %s failed rc=%d", d.c_str(), rc);
+            std::lock_guard<std::mutex> lk(mu_);
+            cloud_kickstarted_devs_.erase(d);
+        }
+    }
 }
 
 int Agent::cloud_send_message(const std::string& dev_id,

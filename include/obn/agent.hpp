@@ -497,6 +497,16 @@ private:
     // this. Safe/cheap to call repeatedly (registry dedups).
     void publish_peer_cert_pin(const std::string& ip, const std::string& dev_id);
 
+    // Publishes one pushing.pushall per freshly subscribed cloud device so the
+    // device panel fills in without waiting for the printer to volunteer
+    // telemetry. Stock plugins do the same (research/06.02: kickstart pushall
+    // with the constant sequence_id "0"); we need it because our cloud
+    // bootstrap is otherwise report-driven — Studio only hears
+    // on_printer_connected once a report arrives, and only then asks for a
+    // snapshot, so a silent printer never gets bootstrapped at all. Safe to
+    // call repeatedly: each device is asked at most once per cloud session.
+    void kickstart_cloud_status();
+
     mutable std::mutex mu_;
     std::string        log_dir_;
     std::string        config_dir_;
@@ -575,11 +585,21 @@ private:
     std::map<std::string, bool>                 dev_mode_on_by_dev_;
     std::map<std::string, bool>                 tutk_server_ready_by_dev_;
 
-    // First cloud report per dev_id flips this set, which is what
-    // triggers the one-shot on_printer_connected("tunnel/<id>")
-    // notification. Cleared on disconnect/resubscribe so reconnects
-    // re-fire the notification.
+    // Devices seen on the current cloud session (first report flips them in).
+    // disconnect_cloud drains this set to release the RSA pubkeys learned
+    // while it lasted. Cleared on disconnect/resubscribe.
     std::set<std::string> cloud_connected_devs_;
+
+    // Devices for which the one-shot on_printer_connected("tunnel/<id>")
+    // notification was actually delivered. Kept apart from
+    // cloud_connected_devs_ so a report arriving before Studio registers the
+    // callback does not consume the notification for the whole session.
+    // Cleared alongside it.
+    std::set<std::string> cloud_notified_devs_;
+
+    // Devices already asked for a full status snapshot on this cloud session
+    // (see kickstart_cloud_status). Cleared alongside the sets above.
+    std::set<std::string> cloud_kickstarted_devs_;
 
     // Holds the cloud session (tokens + profile). Lazily populated from
     // <config_dir>/obn.auth.json as soon as config_dir_ is set.

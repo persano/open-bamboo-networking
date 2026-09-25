@@ -4,6 +4,9 @@
 #include "obn/log.hpp"
 #include "obn/os_compat.hpp"
 
+#include <chrono>
+#include <filesystem>
+
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
@@ -24,7 +27,6 @@
 #endif
 
 #include <cerrno>
-#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <map>
@@ -300,22 +302,25 @@ EVP_PKEY* get_printer_pub_key(const std::string& dev_id)
         }
     }
 
-    // Disk fallback: in pure cloud mode or when LAN wasn't connected yet,
+    // Disk fallback: in pure cloud mode or before LAN connects,
     // look for certs/<dev_id>.pem in config_dir so signed commands
     // have url_enc/param_enc populated.
     const std::string& cdir = obn::config::dir();
-    if (!cdir.empty()) {
-        const std::string cert_file = device_cert_path(cdir, dev_id);
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(cert_file, ec)) {
-            if (prime_pub_key_from_cert_file(dev_id, cert_file)) {
-                std::lock_guard<std::mutex> lk(g_pubkey_mu);
-                g_pubkey_neg_cache.erase(dev_id);
-                auto it = g_pubkey_map.find(dev_id);
-                if (it != g_pubkey_map.end()) {
-                    ::EVP_PKEY_up_ref(it->second);
-                    return it->second;
-                }
+    // No config dir yet: there is nowhere to look, so do not remember a miss
+    // for a lookup that never happened — the caller may retry once Studio has
+    // handed us the data dir.
+    if (cdir.empty()) return nullptr;
+
+    const std::string cert_file = device_cert_path(cdir, dev_id);
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(cert_file, ec)) {
+        if (prime_pub_key_from_cert_file(dev_id, cert_file)) {
+            std::lock_guard<std::mutex> lk(g_pubkey_mu);
+            g_pubkey_neg_cache.erase(dev_id);
+            auto it = g_pubkey_map.find(dev_id);
+            if (it != g_pubkey_map.end()) {
+                ::EVP_PKEY_up_ref(it->second);
+                return it->second;
             }
         }
     }
@@ -361,14 +366,16 @@ bool set_printer_pub_key_from_cert_pem(const std::string& dev_id,
     }
     // The device cert is authoritative, so replace any existing entry (e.g. a
     // TLS-leaf TOFU fallback) rather than keeping it like set_printer_pub_key.
-    std::lock_guard<std::mutex> lk(g_pubkey_mu);
-    g_pubkey_neg_cache.erase(dev_id);
-    auto it = g_pubkey_map.find(dev_id);
-    if (it != g_pubkey_map.end()) {
-        ::EVP_PKEY_free(it->second);
-        it->second = pk;
-    } else {
-        g_pubkey_map.emplace(dev_id, pk);
+    {
+        std::lock_guard<std::mutex> lk(g_pubkey_mu);
+        g_pubkey_neg_cache.erase(dev_id);
+        auto it = g_pubkey_map.find(dev_id);
+        if (it != g_pubkey_map.end()) {
+            ::EVP_PKEY_free(it->second);
+            it->second = pk;
+        } else {
+            g_pubkey_map.emplace(dev_id, pk);
+        }
     }
     return true;
 }
