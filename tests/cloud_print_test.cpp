@@ -1,15 +1,23 @@
-// Tests for cloud_print.cpp — covers ams_mapping2_for_cloud() and
-// build_task_body(). All tests are pure-function (no HTTP, no network).
-// Built with -DOBN_TESTING which promotes those functions to
-// obn::cloud_print::test_ams_mapping2 / test_build_task_body.
+// Tests for cloud_print.cpp — covers ams_mapping2_for_cloud(),
+// build_task_body() and apply_mytask_pop(). All tests are pure-function
+// (no HTTP, no network). Built with -DOBN_TESTING which promotes those
+// functions to obn::cloud_print::test_ams_mapping2 / test_build_task_body /
+// test_apply_mytask_pop.
 
 #include "obn/bambu_networking.hpp"
+#include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/print_job.hpp"
+#include "obn/signing.hpp"
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 
 namespace obn::cloud_print {
@@ -20,6 +28,7 @@ namespace obn::cloud_print {
                                      const std::string& profile_id,
                                      bool use_lan_channel);
     std::string test_md5_file_hex_upper(const std::string& path);
+    bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs);
 }
 
 static int fail_count = 0;
@@ -814,6 +823,135 @@ static void test_md5_file_hex_upper_matches_stock_style()
 }
 
 // ---------------------------------------------------------------------------
+// mytask_pop: opt-in PoP headers on POST /my/task
+// ---------------------------------------------------------------------------
+
+// Write a throwaway RSA key + matching self-signed leaf as slicer_key.pem /
+// slicer_cert.pem in `dir`, the layout apply_mytask_pop falls back to when
+// obn.conf slicer_key_pem / slicer_cert_pem are empty.
+static bool write_test_signing_material(const std::filesystem::path& dir)
+{
+    EVP_PKEY* key = EVP_RSA_gen(2048);
+    if (!key) return false;
+
+    bool ok = false;
+    {
+        FILE* f = std::fopen((dir / "slicer_key.pem").string().c_str(), "w");
+        if (f) {
+            ok = PEM_write_PrivateKey(f, key, nullptr, nullptr, 0, nullptr,
+                                       nullptr) == 1;
+            std::fclose(f);
+        }
+    }
+
+    if (ok) {
+        X509* cert = X509_new();
+        X509_NAME* name = X509_NAME_new();
+        if (!cert || !name ||
+            X509_set_version(cert, 2) != 1 ||
+            ASN1_INTEGER_set(X509_get_serialNumber(cert), 1) != 1 ||
+            X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                reinterpret_cast<const unsigned char*>("obn-test"), -1, -1, 0) != 1 ||
+            X509_set_subject_name(cert, name) != 1 ||
+            X509_set_issuer_name(cert, name) != 1 ||
+            !X509_gmtime_adj(X509_getm_notBefore(cert), 0) ||
+            !X509_gmtime_adj(X509_getm_notAfter(cert), 60L * 60 * 24 * 365) ||
+            X509_set_pubkey(cert, key) != 1 ||
+            X509_sign(cert, key, EVP_sha256()) == 0) {
+            ok = false;
+        } else {
+            FILE* f = std::fopen((dir / "slicer_cert.pem").string().c_str(), "w");
+            if (!f) {
+                ok = false;
+            } else {
+                ok = PEM_write_X509(f, cert) == 1;
+                std::fclose(f);
+            }
+        }
+        X509_NAME_free(name);
+        X509_free(cert);
+    }
+
+    EVP_PKEY_free(key);
+    return ok;
+}
+
+static void test_mytask_pop_off_by_default()
+{
+    std::map<std::string, std::string> hdrs;
+    hdrs["X-BBL-Client-Name"] = "BambuStudio";
+    CHECK(!obn::cloud_print::test_apply_mytask_pop(hdrs));
+    CHECK(hdrs.count("x-bbl-app-certification-id") == 0);
+    CHECK(hdrs.count("x-bbl-device-security-sign") == 0);
+    CHECK(hdrs.at("X-BBL-Client-Name") == "BambuStudio");
+}
+
+static void test_mytask_pop_on_without_material_is_noop()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+                     / "obn-mytask-pop-nomat";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    {
+        std::ofstream out(dir / "obn.conf");
+        out << "mytask_pop = 1\n";
+    }
+    obn::config::load_or_create(dir.string());
+    obn::signing::invalidate_cache();
+
+    // Flag on but no key/cert: add_pop_headers must send nothing rather
+    // than a blank pair (a blank pair 403s on its own).
+    std::map<std::string, std::string> hdrs;
+    CHECK(!obn::cloud_print::test_apply_mytask_pop(hdrs));
+    CHECK(hdrs.count("x-bbl-app-certification-id") == 0);
+    CHECK(hdrs.count("x-bbl-device-security-sign") == 0);
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_mytask_pop_on_with_material_attaches_pair()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+                     / "obn-mytask-pop-material";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    CHECK(write_test_signing_material(dir));
+    {
+        std::ofstream out(dir / "obn.conf");
+        out << "mytask_pop = 1\n";
+    }
+    obn::config::load_or_create(dir.string());
+    obn::signing::invalidate_cache();
+
+    std::map<std::string, std::string> hdrs;
+    hdrs["X-BBL-Client-Name"] = "BambuStudio";
+    CHECK(obn::cloud_print::test_apply_mytask_pop(hdrs));
+
+    const auto cert_id = hdrs.find("x-bbl-app-certification-id");
+    const auto sign    = hdrs.find("x-bbl-device-security-sign");
+    CHECK(cert_id != hdrs.end() && !cert_id->second.empty());
+    CHECK(sign != hdrs.end() && sign->second.empty() == false);
+    // HTTP form: issuer:serial.lower(), even-width hex (serial 1 -> "01").
+    CHECK(cert_id != hdrs.end()
+          && cert_id->second == "CN=obn-test:01");
+    // PoP must not clobber the client identity headers.
+    CHECK(hdrs.at("X-BBL-Client-Name") == "BambuStudio");
+
+    // Drop back to the default: the next call omits the pair again.
+    {
+        std::ofstream out(dir / "obn.conf");
+        out << "mytask_pop = 0\n";
+    }
+    obn::config::load_or_create(dir.string());
+    std::map<std::string, std::string> off;
+    CHECK(!obn::cloud_print::test_apply_mytask_pop(off));
+    CHECK(off.count("x-bbl-app-certification-id") == 0);
+    CHECK(off.count("x-bbl-device-security-sign") == 0);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -878,6 +1016,11 @@ int main()
 
     test_format_upload_info_matches_stock();
     test_md5_file_hex_upper_matches_stock_style();
+
+    // Runs last: these load obn.conf into the process-global config.
+    test_mytask_pop_off_by_default();
+    test_mytask_pop_on_without_material_is_noop();
+    test_mytask_pop_on_with_material_attaches_pair();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

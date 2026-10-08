@@ -116,6 +116,17 @@ struct Settings {
     // built-in value stops being accepted.
     std::string executable_info;
 
+    // Attach proof-of-possession headers (`x-bbl-app-certification-id` +
+    // `x-bbl-device-security-sign`) to POST /v1/user-service/my/task.
+    // Default 0 keeps the historical behaviour (bearer token + client
+    // identity only). Set 1 on the CN cloud, where the same account and
+    // client name that 200 on api.bambulab.com answer 403 on
+    // api.bambulab.cn (H2D report 2026-10-08, obn(2).log) and research
+    // 10.05 lists /my/task as PoP-required on secured printers. add_pop_headers
+    // silently sends nothing when the slicer key/cert material is absent or
+    // mismatched, so 1 is safe on accounts without credentials.
+    bool mytask_pop = false;
+
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
     std::string bambusource_log_stderr;

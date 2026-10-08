@@ -709,6 +709,45 @@ std::string build_task_body(const BBL::PrintParams& p,
     return os.str();
 }
 
+// Attach the obn.conf mytask_pop signing pair to the /my/task headers.
+//
+// Opt-in via mytask_pop (default off). Off keeps the long-standing
+// behaviour: Bearer token + client identity only, which is what
+// api.bambulab.com accepts for this write. On, we attach
+// x-bbl-app-certification-id + x-bbl-device-security-sign, which
+// research/10.05 lists as required on secured printers and which the CN
+// cloud appears to demand for the same request that 200s on .com (H2D
+// report 2026-10-08, obn(2).log: client_name=BambuStudio, still 403).
+// add_pop_headers is best-effort and key-match guarded: no material or
+// a key/cert mismatch means no headers rather than a blank pair that
+// would 403 on its own. The cloud verifies x-bbl-device-security-sign by
+// recovering a recent timestamp from the signature (current time in ms,
+// raw PKCS#1 v1.5, not the body). The HTTP header uses
+// `issuer:serial.lower()`, a DIFFERENT serialization from the MQTT
+// envelope cert_id (`serial+issuer`); add_pop_headers emits the HTTP
+// form, so the MQTT-form 403 does not apply here.
+//
+// Returns true when the pair was attached, false when omitted (flag off,
+// or flag on with unusable signing material).
+bool apply_mytask_pop(std::map<std::string, std::string>& hdrs)
+{
+    if (!obn::config::current().mytask_pop) {
+        OBN_DEBUG("cloud_print: mytask_pop=0; PoP headers omitted");
+        return false;
+    }
+    if (!obn::signing::add_pop_headers(hdrs)) {
+        OBN_WARN("cloud_print: mytask_pop=1 but PoP headers were not attached "
+                 "(slicer key/cert missing or mismatched; see obn.conf "
+                 "slicer_key_pem/slicer_cert_pem)");
+        return false;
+    }
+    OBN_DEBUG("cloud_print: mytask_pop=1 attached PoP cert_id='%s' "
+              "sec_sign_len=%zu",
+              hdrs["x-bbl-app-certification-id"].c_str(),
+              hdrs["x-bbl-device-security-sign"].size());
+    return true;
+}
+
 int create_task(const std::string& api, const std::string& token,
                 const std::string& user_id,
                 const std::string& body, std::string* out_task_id,
@@ -733,23 +772,7 @@ int create_task(const std::string& api, const std::string& token,
                  "BambuStudio; /my/task answers 403 for it (obn.conf "
                  "client_name, see research/06.06-cloud-rest.md)",
                  hdrs["X-BBL-Client-Name"].c_str());
-    // Signing headers are best-effort: when no slicer key/cert is configured
-    // these come back empty, and we omit them rather than send blanks. The
-    // cloud verifies x-bbl-device-security-sign by recovering a recent
-    // timestamp from the signature (current time in ms, raw PKCS#1 v1.5, not
-    // the body); it is only enforced on signed writes.
-    // The HTTP header uses `issuer:serial.lower()`, a DIFFERENT serialization
-    // from the MQTT envelope cert_id (`serial+issuer`). Sending the MQTT form
-    // here gets the write rejected with 403.
-    const std::string cert_id  = obn::signing::app_certification_id();
-    const std::string sec_sign = obn::signing::device_security_sign();
-    OBN_DEBUG("cloud_print: create_task sign hdrs cert_id='%s' (len=%zu) sec_sign_len=%zu",
-              cert_id.c_str(), cert_id.size(), sec_sign.size());
-    // Signing headers: Bambu Cloud user-service verifies Bearer token + client identity.
-    // Presenting third-party app certs on /my/task causes 403 ("The client does not have access rights to the content").
-    // Omit PoP headers on cloud /my/task dispatch so server authorizes with standard bearer + client identity.
-    (void)cert_id;
-    (void)sec_sign;
+    apply_mytask_pop(hdrs);
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
@@ -817,6 +840,8 @@ std::string test_build_task_body(const BBL::PrintParams& p,
     { return build_task_body(p, project_id, model_id, profile_id, use_lan_channel); }
 std::string test_md5_file_hex_upper(const std::string& path)
     { return md5_file_hex_upper(path); }
+bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs)
+    { return apply_mytask_pop(hdrs); }
 } // namespace cloud_print
 #endif
 

@@ -169,7 +169,8 @@ static int test_new_keys()
                "bambusource_log_level = debug\n"
                "bambusource_log_stderr = 0\n"
                "bambusource_log_to_file = 1\n"
-               "bambusource_log_file = /tmp/bs.log\n");
+               "bambusource_log_file = /tmp/bs.log\n"
+               "mytask_pop = 1\n");
     const auto cfg = obn::config::load_or_create(dir.string());
     CHECK(cfg.lan_tls_skip_verify == true);
     CHECK(cfg.cloud_mqtt_port == 1883);
@@ -189,6 +190,7 @@ static int test_new_keys()
     CHECK(cfg.bambusource_log_stderr == "0");
     CHECK(cfg.bambusource_log_to_file == "1");
     CHECK(cfg.bambusource_log_file == "/tmp/bs.log");
+    CHECK(cfg.mytask_pop == true);
     return 0;
 }
 
@@ -215,6 +217,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.bambusource_log_stderr.empty());
     CHECK(cfg.bambusource_log_to_file.empty());
     CHECK(cfg.bambusource_log_file.empty());
+    CHECK(cfg.mytask_pop == false);
     return 0;
 }
 

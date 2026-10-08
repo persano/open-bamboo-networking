@@ -251,6 +251,22 @@ client_name = BambuStudio
 
 executable_info = 
 
+# Attach proof-of-possession headers (x-bbl-app-certification-id +
+# x-bbl-device-security-sign) to POST /v1/user-service/my/task, the call
+# that registers a cloud print with MakerWorld.
+#
+#   0  Default. Bearer token + client identity only. This is what
+#      api.bambulab.com accepts and what this plugin has always sent.
+#   1  Also send the proof-of-possession pair. Try this when cloud print
+#      fails with HTTP 403 on /my/task while client_name is already
+#      "BambuStudio" and every other API answers 200: that is the CN
+#      cloud signature (api.bambulab.cn, H2D report 2026-10-08), and
+#      research/10.05 lists /my/task as proof-of-possession-required on
+#      a verified printer. Harmless when no slicer key/cert is present:
+#      the headers are then simply not sent.
+
+mytask_pop = 0
+
 # How a print is sent when the slicer wants to use the cloud / "print
 # with record" path (typical for a printer that is linked to your
 # Bambu account). This does not change pure LAN-only printers.
