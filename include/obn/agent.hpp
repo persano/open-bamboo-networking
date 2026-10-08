@@ -204,9 +204,8 @@ public:
     // Returns false when the app cert PEM is missing or publish fails.
     bool request_app_cert_install(const std::string& dev_id);
 
-    // Publishes the security.app_cert_list query (see reverse-networking
-    // "5. MQTT.md"): asks the printer which app certificates it already
-    // trusts. The report response is parsed by harvest_security_report into
+    // Publishes the security.app_cert_list query (research/10.02-secrets.md):
+    // asks the printer which app certificates it already trusts. The report response is parsed by harvest_security_report into
     // app_certs_by_dev_. Returns false on publish failure.
     bool request_app_cert_list(const std::string& dev_id);
 
@@ -436,9 +435,9 @@ public:
     // The :6000 CTRL port stays open then, but there is no LAN video.
     bool lan_liveview_off(const std::string& dev_id) const;
     // Remote cloud camera URL for bambu_network_get_camera_url when the LAN
-    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode
-    // and returns "bambu:///tutk?uid=...". The cloud itself pushes
-    // liveview.prepare to the printer in response to that POST.
+    // route is unavailable. Fetches TUTK credentials via /v1/iot-service/api/user/ttcode,
+    // proactively dispatches signed/encrypted prepare command to the printer,
+    // and returns "bambu:///tutk?uid=...".
     std::string remote_camera_url(const std::string& dev_id);
     // Friendly name from the last SSDP packet for this printer IP, or "".
     std::string device_display_name_for_ip(const std::string& dev_ip) const;
