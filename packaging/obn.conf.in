@@ -163,6 +163,10 @@ patch_mqtt_ipcam_file = 0
 
 patch_mqtt_internal_storage = 0
 
+# Filter the "MQTT verification failure" error so the slicer does not show it.
+# This fork ships the filter enabled (upstream default is 0, opt-in).
+filter_mqtt_hms_65543 = 1
+
 
 # --- EXPERIMENT: numeric sequence_id (opt-in) -------------------------
 #

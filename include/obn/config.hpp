@@ -83,6 +83,9 @@ struct Settings {
     bool patch_mqtt_home_flag        = false;
     bool patch_mqtt_ipcam_file       = false;
     bool patch_mqtt_internal_storage = false;
+    // On by default in this fork: the banner fix ships enabled (upstream
+    // default is false, opt-in). Set 0 to see the raw 65543 entries again.
+    bool filter_mqtt_hms_65543       = true;
 
     // EXP-01 experiment mode: emit `sequence_id` as a JSON number on exactly
     // the frames the plugin builds AND signs (project_file, liveview prepare,

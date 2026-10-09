@@ -166,6 +166,7 @@ static int test_new_keys()
                "patch_mqtt_home_flag = yes\n"
                "patch_mqtt_ipcam_file = true\n"
                "patch_mqtt_internal_storage = 1\n"
+               "filter_mqtt_hms_65543 = yes\n"
                "bambusource_log_level = debug\n"
                "bambusource_log_stderr = 0\n"
                "bambusource_log_to_file = 1\n"
@@ -186,6 +187,7 @@ static int test_new_keys()
     CHECK(cfg.patch_mqtt_home_flag == true);
     CHECK(cfg.patch_mqtt_ipcam_file == true);
     CHECK(cfg.patch_mqtt_internal_storage == true);
+    CHECK(cfg.filter_mqtt_hms_65543 == true);
     CHECK(cfg.bambusource_log_level == "debug");
     CHECK(cfg.bambusource_log_stderr == "0");
     CHECK(cfg.bambusource_log_to_file == "1");
@@ -213,6 +215,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.patch_mqtt_home_flag == false);
     CHECK(cfg.patch_mqtt_ipcam_file == false);
     CHECK(cfg.patch_mqtt_internal_storage == false);
+    CHECK(cfg.filter_mqtt_hms_65543 == true); // this fork ships it enabled
     CHECK(cfg.bambusource_log_level.empty());
     CHECK(cfg.bambusource_log_stderr.empty());
     CHECK(cfg.bambusource_log_to_file.empty());
