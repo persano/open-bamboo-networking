@@ -283,6 +283,31 @@ static int test_mytask_pop_values()
     return 0;
 }
 
+static int test_version_override()
+{
+    const fs::path dir = make_temp_dir();
+    const fs::path path = dir / obn::config::kVersionOverrideFileName;
+
+    CHECK(obn::config::read_version_override(dir.string()).empty());
+
+    { std::ofstream out(path); out << "02.09.01.55\n"; }
+    CHECK(obn::config::read_version_override(dir.string()) == "02.09.01.55");
+
+    { std::ofstream out(path); out << "not a version!!\n"; }
+    CHECK(obn::config::read_version_override(dir.string()).empty());
+
+    { std::ofstream out(path); out << "................\n"; }
+    CHECK(obn::config::read_version_override(dir.string()).empty());
+
+    { std::ofstream out(path); out << " 02.09.01.99 \n"; }
+    CHECK(obn::config::read_version_override(dir.string()) == "02.09.01.99");
+
+    // reported_version() prefers the active config dir.
+    (void)obn::config::load_or_create(dir.string());
+    CHECK(obn::config::reported_version() == "02.09.01.99");
+    return 0;
+}
+
 int main()
 {
     if (test_parse_keys() != 0) return 1;
@@ -296,6 +321,7 @@ int main()
     if (test_load_if_exists() != 0) return 1;
     if (test_cloud_mqtt_port_bounds() != 0) return 1;
     if (test_mytask_pop_values() != 0) return 1;
+    if (test_version_override() != 0) return 1;
 
     {
         const fs::path dir = make_temp_dir();

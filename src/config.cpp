@@ -51,6 +51,20 @@ std::string to_lower(const std::string& s)
     return r;
 }
 
+// A reported_version override must look like a Studio version: digits and
+// dots, at least one digit, bounded length.
+bool is_valid_version(const std::string& v)
+{
+    if (v.empty() || v.size() > 32) return false;
+    bool has_digit = false;
+    for (char c : v) {
+        if (c == '.') continue;
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+        has_digit = true;
+    }
+    return has_digit;
+}
+
 bool parse_line(const std::string& line, std::string& key, std::string& val)
 {
     key.clear();
@@ -376,6 +390,51 @@ std::string path_in_dir(const std::string& basename)
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_config_dir.empty()) return {};
     return (std::filesystem::path(g_config_dir) / basename).string();
+}
+
+std::string read_version_override(const std::string& dir)
+{
+    if (dir.empty()) return {};
+    const auto path = std::filesystem::path(dir) / kVersionOverrideFileName;
+    std::ifstream in(path);
+    if (!in) return {};
+    std::string v;
+    if (!std::getline(in, v)) return {};
+    v = trim(v);
+    if (!is_valid_version(v)) {
+        OBN_WARN("reported_version='%s' in %s is not a version; ignoring",
+                 v.c_str(), dir.c_str());
+        return {};
+    }
+    return v;
+}
+
+std::string reported_version()
+{
+    // get_version() is called before load_or_create(), so config::dir() is
+    // usually still empty here; probe the same OrcaSlicer data dirs the
+    // plugin installer writes into.
+    std::vector<std::filesystem::path> dirs;
+    if (const std::string cfg = dir(); !cfg.empty())
+        dirs.push_back(std::filesystem::path(cfg));
+#if defined(_WIN32)
+    if (const char* appdata = std::getenv("APPDATA"))
+        dirs.push_back(std::filesystem::path(appdata) / "OrcaSlicer");
+#elif defined(__APPLE__)
+    if (const char* home = std::getenv("HOME"))
+        dirs.push_back(std::filesystem::path(home) / "Library" /
+                       "Application Support" / "OrcaSlicer");
+#else
+    if (const char* xdg = std::getenv("XDG_CONFIG_HOME"))
+        dirs.push_back(std::filesystem::path(xdg) / "OrcaSlicer");
+    if (const char* home = std::getenv("HOME"))
+        dirs.push_back(std::filesystem::path(home) / ".config" / "OrcaSlicer");
+#endif
+    for (const auto& d : dirs) {
+        const std::string v = read_version_override(d.string());
+        if (!v.empty()) return v;
+    }
+    return {};
 }
 
 std::string cloud_api_host_for(const Settings& s, const std::string& region)

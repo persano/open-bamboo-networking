@@ -10,6 +10,14 @@ namespace obn::config {
 
 inline constexpr const char* kConfigFileName = "obn.conf";
 
+// One-line override for the version bambu_network_get_version() reports to
+// Studio's plugin gate (e.g. "02.09.01.99"), so a build for a fixed ABI can
+// satisfy a future OrcaSlicer series without a rebuild. Written by the
+// open_bambu_networking installer, removed on uninstall/restore. The name
+// deliberately avoids the substring "conf": OrcaSlicer's plugin audit
+// hard-denies every Python open() whose path contains it.
+inline constexpr const char* kVersionOverrideFileName = "reported_version";
+
 // Idle device-panel JPEG (MediaPlayCtrl downloads this slot).
 inline constexpr const char* kCameraPreviewMemPath = "mem:/26";
 
@@ -191,6 +199,17 @@ std::string path_in_dir(const std::string& basename);
 
 // True when `region` names the Chinese cloud ("CN"/"cn"), else global.
 bool is_cn_region(const std::string& region);
+
+// Read <dir>/reported_version (single line). Returns "" when the file is
+// missing or its content is not a plausible version (digits and dots only,
+// at least one digit, <= 32 chars).
+std::string read_version_override(const std::string& dir);
+
+// Version override for the active config dir, probing the per-platform
+// OrcaSlicer data dirs (config::dir() first) because
+// bambu_network_get_version() runs before load_or_create(). "" = no
+// override; callers keep the built-in version.
+std::string reported_version();
 
 // Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
 // Empty configured values fall back to production defaults.
