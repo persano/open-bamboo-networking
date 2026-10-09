@@ -711,44 +711,52 @@ std::string build_task_body(const BBL::PrintParams& p,
 
 // Attach the obn.conf mytask_pop signing pair to the /my/task headers.
 //
-// Opt-in via mytask_pop (default off). Off keeps the long-standing
-// behaviour: Bearer token + client identity only, which is what
-// api.bambulab.com accepts for this write. On, we attach
-// x-bbl-app-certification-id + x-bbl-device-security-sign, which
-// research/10.05 lists as required on secured printers and which the CN
-// cloud appears to demand for the same request that 200s on .com (H2D
-// report 2026-10-08, obn(2).log: client_name=BambuStudio, still 403).
-// add_pop_headers is best-effort and key-match guarded: no material or
-// a key/cert mismatch means no headers rather than a blank pair that
-// would 403 on its own. The cloud verifies x-bbl-device-security-sign by
-// recovering a recent timestamp from the signature (current time in ms,
-// raw PKCS#1 v1.5, not the body). The HTTP header uses
-// `issuer:serial.lower()`, a DIFFERENT serialization from the MQTT
-// envelope cert_id (`serial+issuer`); add_pop_headers emits the HTTP
+// The default (key absent or `auto`) decides by region: the CN cloud
+// answers 403 to the bearer-only request that api.bambulab.com accepts
+// for the same account and client name (H2D report 2026-10-08,
+// obn(2).log: client_name=BambuStudio, still 403; research/10.05 lists
+// /my/task as PoP-required on secured printers), so the pair is attached
+// there and the long-standing behaviour is kept everywhere else.
+// mytask_pop = 1 forces the pair on for any region, 0 forces it off
+// (including CN). On, we attach x-bbl-app-certification-id +
+// x-bbl-device-security-sign. add_pop_headers is best-effort and
+// key-match guarded: no material or a key/cert mismatch means no headers
+// rather than a blank pair that would 403 on its own. The cloud verifies
+// x-bbl-device-security-sign by recovering a recent timestamp from the
+// signature (current time in ms, raw PKCS#1 v1.5, not the body). The HTTP
+// header uses `issuer:serial.lower()`, a DIFFERENT serialization from the
+// MQTT envelope cert_id (`serial+issuer`); add_pop_headers emits the HTTP
 // form, so the MQTT-form 403 does not apply here.
 //
-// Returns true when the pair was attached, false when omitted (flag off,
-// or flag on with unusable signing material).
-bool apply_mytask_pop(std::map<std::string, std::string>& hdrs)
+// Returns true when the pair was attached, false when omitted (effective
+// flag off, or on with unusable signing material).
+bool apply_mytask_pop(std::map<std::string, std::string>& hdrs,
+                      const std::string& region)
 {
-    if (!obn::config::current().mytask_pop) {
-        OBN_DEBUG("cloud_print: mytask_pop=0; PoP headers omitted");
+    const auto& cfg = obn::config::current();
+    const bool on = cfg.mytask_pop_set ? cfg.mytask_pop
+                                       : obn::config::is_cn_region(region);
+    if (!on) {
+        OBN_DEBUG("cloud_print: mytask_pop off (region=%s); PoP headers omitted",
+                  region.c_str());
         return false;
     }
     if (!obn::signing::add_pop_headers(hdrs)) {
-        OBN_WARN("cloud_print: mytask_pop=1 but PoP headers were not attached "
+        OBN_WARN("cloud_print: mytask_pop on but PoP headers were not attached "
                  "(slicer key/cert missing or mismatched; see obn.conf "
                  "slicer_key_pem/slicer_cert_pem)");
         return false;
     }
-    OBN_DEBUG("cloud_print: mytask_pop=1 attached PoP cert_id='%s' "
+    OBN_DEBUG("cloud_print: mytask_pop on (region=%s) attached PoP cert_id='%s' "
               "sec_sign_len=%zu",
+              region.c_str(),
               hdrs["x-bbl-app-certification-id"].c_str(),
               hdrs["x-bbl-device-security-sign"].size());
     return true;
 }
 
-int create_task(const std::string& api, const std::string& token,
+int create_task(const std::string& api, const std::string& region,
+                const std::string& token,
                 const std::string& user_id,
                 const std::string& body, std::string* out_task_id,
                 BBL::OnUpdateStatusFn update_fn)
@@ -772,7 +780,7 @@ int create_task(const std::string& api, const std::string& token,
                  "BambuStudio; /my/task answers 403 for it (obn.conf "
                  "client_name, see research/06.06-cloud-rest.md)",
                  hdrs["X-BBL-Client-Name"].c_str());
-    apply_mytask_pop(hdrs);
+    apply_mytask_pop(hdrs, region);
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
@@ -840,8 +848,9 @@ std::string test_build_task_body(const BBL::PrintParams& p,
     { return build_task_body(p, project_id, model_id, profile_id, use_lan_channel); }
 std::string test_md5_file_hex_upper(const std::string& path)
     { return md5_file_hex_upper(path); }
-bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs)
-    { return apply_mytask_pop(hdrs); }
+bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs,
+                           const std::string& region)
+    { return apply_mytask_pop(hdrs, region); }
 } // namespace cloud_print
 #endif
 
@@ -1053,7 +1062,8 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
     std::string task_body = build_task_body(p, info.project_id, info.model_id,
                                             info.profile_id, use_lan_channel);
     std::string task_id;
-    if (int rc = create_task(api, token, uid, task_body, &task_id, update_fn);
+    if (int rc = create_task(api, cloud_region(), token, uid, task_body,
+                             &task_id, update_fn);
         rc != 0) return rc;
 
 

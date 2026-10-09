@@ -121,14 +121,19 @@ struct Settings {
 
     // Attach proof-of-possession headers (`x-bbl-app-certification-id` +
     // `x-bbl-device-security-sign`) to POST /v1/user-service/my/task.
-    // Default 0 keeps the historical behaviour (bearer token + client
-    // identity only). Set 1 on the CN cloud, where the same account and
-    // client name that 200 on api.bambulab.com answer 403 on
-    // api.bambulab.cn (H2D report 2026-10-08, obn(2).log) and research
-    // 10.05 lists /my/task as PoP-required on secured printers. add_pop_headers
+    // Default (key absent or `auto`) decides by region: the CN cloud
+    // answers 403 to the bearer-only request that api.bambulab.com accepts
+    // for the same account and client name (H2D report 2026-10-08,
+    // obn(2).log) and research 10.05 lists /my/task as PoP-required on
+    // secured printers, so the pair is attached on CN and the historical
+    // bearer-only request is kept elsewhere. Set 1 to force the pair on for
+    // any region, 0 to force it off (including CN). add_pop_headers
     // silently sends nothing when the slicer key/cert material is absent or
-    // mismatched, so 1 is safe on accounts without credentials.
+    // mismatched, so `auto` is safe on accounts without credentials.
     bool mytask_pop = false;
+    // Whether obn.conf carries an explicit mytask_pop = 0/1, as opposed to
+    // the absent-key (or `mytask_pop = auto`) region-based default.
+    bool mytask_pop_set = false;
 
     // BambuSource logging — propagated to libBambuSource via obn.env
     std::string bambusource_log_level;
@@ -183,6 +188,9 @@ const std::string& dir();
 // of hand-concatenating "dir + \"/\" + name", which is not portable to
 // Windows.
 std::string path_in_dir(const std::string& basename);
+
+// True when `region` names the Chinese cloud ("CN"/"cn"), else global.
+bool is_cn_region(const std::string& region);
 
 // Resolve cloud endpoints for `region` ("CN"/"cn" = China, else global).
 // Empty configured values fall back to production defaults.

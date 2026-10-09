@@ -29,11 +29,6 @@ constexpr const char* kDefaultCnApi      = "https://api.bambulab.cn";
 constexpr const char* kDefaultCnWeb      = "https://bambulab.cn";
 constexpr const char* kDefaultCnMqtt     = "cn.mqtt.bambulab.com";
 
-bool is_cn_region(const std::string& region)
-{
-    return region == "CN" || region == "cn";
-}
-
 const char* pick_or_default(const std::string& configured, const char* fallback)
 {
     return configured.empty() ? fallback : configured.c_str();
@@ -118,7 +113,13 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
     else if (key == "slicer_crl_pem")              out.slicer_crl_pem = val;
     else if (key == "client_name")                 out.client_name = val;
     else if (key == "executable_info")             out.executable_info = val;
-    else if (key == "mytask_pop")                  out.mytask_pop = truthy(val);
+    else if (key == "mytask_pop") {
+        // `auto` and an absent key both mean the region-based default
+        // (PoP on CN, historical bearer-only request elsewhere).
+        const bool explicit_val = to_lower(val) != "auto";
+        out.mytask_pop_set = explicit_val;
+        out.mytask_pop      = explicit_val ? truthy(val) : false;
+    }
     else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
     else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
     else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;
@@ -296,6 +297,11 @@ EnsureOutcome ensure_block_cloud_in_file(const std::filesystem::path& path)
 }
 
 } // namespace
+
+bool is_cn_region(const std::string& region)
+{
+    return region == "CN" || region == "cn";
+}
 
 bool truthy(const std::string& val, bool fallback)
 {

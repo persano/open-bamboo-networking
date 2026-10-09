@@ -497,7 +497,7 @@ Spaces around `=` are optional.
 | Key | Default | Effect |
 | --- | --- | --- |
 | `exp_numeric_sequence_id` | `0` | Emit `sequence_id` as a JSON number instead of the string form on the signed frames the plugin builds itself (the `project_file` print command, the liveview prepare and the rescue re-publishes) — experimental, for the open numeric-`sequence_id` question in `research/06.02-mqtt.md`; leaving it at `0` keeps stock behaviour. Nothing else changes: `security.*` frames, the pushall constant and Studio-authored frames keep their form. |
-| `mytask_pop` | `0` | Attach proof-of-possession headers (`x-bbl-app-certification-id` + `x-bbl-device-security-sign`) to `POST /v1/user-service/my/task`. Default keeps the historical bearer-only request, which `api.bambulab.com` accepts. Set to `1` when `/my/task` answers 403 with `client_name = BambuStudio` while every other API answers 200, the CN cloud signature (H2D report 2026-10-08); research `10.05` lists `/my/task` as PoP-required on verified printers. No slicer key/cert present means no headers are sent. |
+| `mytask_pop` | `auto` | Attach proof-of-possession headers (`x-bbl-app-certification-id` + `x-bbl-device-security-sign`) to `POST /v1/user-service/my/task`. Default `auto` attaches them on the CN cloud, where the bearer-only request answers 403 (H2D report 2026-10-08; research `10.05` lists `/my/task` as PoP-required on verified printers), and keeps the historical bearer-only request elsewhere, which `api.bambulab.com` accepts. Set `1` to force on for any region, `0` to force off (including CN). No slicer key/cert present means no headers are sent. |
 
 **Cloud endpoints** (change only for CN accounts or a dev host):
 

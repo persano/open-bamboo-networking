@@ -259,17 +259,21 @@ executable_info =
 # x-bbl-device-security-sign) to POST /v1/user-service/my/task, the call
 # that registers a cloud print with MakerWorld.
 #
-#   0  Default. Bearer token + client identity only. This is what
-#      api.bambulab.com accepts and what this plugin has always sent.
-#   1  Also send the proof-of-possession pair. Try this when cloud print
-#      fails with HTTP 403 on /my/task while client_name is already
-#      "BambuStudio" and every other API answers 200: that is the CN
-#      cloud signature (api.bambulab.cn, H2D report 2026-10-08), and
-#      research/10.05 lists /my/task as proof-of-possession-required on
-#      a verified printer. Harmless when no slicer key/cert is present:
-#      the headers are then simply not sent.
+#   auto  Default. Attach the pair on the CN cloud (api.bambulab.cn),
+#         where the bearer-only request answers 403, and keep the
+#         historical bearer-only request elsewhere (api.bambulab.com
+#         accepts it). Same as leaving this key out.
+#   1     Force the pair on for any region. Try this when cloud print
+#         fails with HTTP 403 on /my/task while client_name is already
+#         "BambuStudio" and every other API answers 200, and research/
+#         10.05 lists /my/task as proof-of-possession-required on a
+#         verified printer.
+#   0     Force the pair off, including on the CN cloud.
+#
+# No slicer key/cert present means no headers are sent, so `auto` is safe
+# on accounts without signing material.
 
-mytask_pop = 0
+mytask_pop = auto
 
 # How a print is sent when the slicer wants to use the cloud / "print
 # with record" path (typical for a printer that is linked to your

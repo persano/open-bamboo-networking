@@ -193,6 +193,7 @@ static int test_new_keys()
     CHECK(cfg.bambusource_log_to_file == "1");
     CHECK(cfg.bambusource_log_file == "/tmp/bs.log");
     CHECK(cfg.mytask_pop == true);
+    CHECK(cfg.mytask_pop_set == true);
     return 0;
 }
 
@@ -221,6 +222,7 @@ static int test_new_keys_defaults()
     CHECK(cfg.bambusource_log_to_file.empty());
     CHECK(cfg.bambusource_log_file.empty());
     CHECK(cfg.mytask_pop == false);
+    CHECK(cfg.mytask_pop_set == false); // absent = region-based auto default
     return 0;
 }
 
@@ -255,6 +257,32 @@ static int test_cloud_mqtt_port_bounds()
     return 0;
 }
 
+static int test_mytask_pop_values()
+{
+    const fs::path dir = make_temp_dir();
+
+    write_conf(dir, "mytask_pop = auto\n");
+    auto cfg = obn::config::load_or_create(dir.string());
+    CHECK(cfg.mytask_pop == false);
+    CHECK(cfg.mytask_pop_set == false); // auto behaves like the absent key
+
+    write_conf(dir, "mytask_pop = 0\n");
+    cfg = obn::config::load_or_create(dir.string());
+    CHECK(cfg.mytask_pop == false);
+    CHECK(cfg.mytask_pop_set == true);  // explicit 0 forces off, incl. CN
+
+    write_conf(dir, "mytask_pop = 1\n");
+    cfg = obn::config::load_or_create(dir.string());
+    CHECK(cfg.mytask_pop == true);
+    CHECK(cfg.mytask_pop_set == true);  // explicit 1 forces on, any region
+
+    write_conf(dir, "mytask_pop = junk\n");
+    cfg = obn::config::load_or_create(dir.string());
+    CHECK(cfg.mytask_pop == false);
+    CHECK(cfg.mytask_pop_set == true);  // unrecognised values are truthy()'s fallback
+    return 0;
+}
+
 int main()
 {
     if (test_parse_keys() != 0) return 1;
@@ -267,6 +295,7 @@ int main()
     if (test_new_keys_defaults() != 0) return 1;
     if (test_load_if_exists() != 0) return 1;
     if (test_cloud_mqtt_port_bounds() != 0) return 1;
+    if (test_mytask_pop_values() != 0) return 1;
 
     {
         const fs::path dir = make_temp_dir();
