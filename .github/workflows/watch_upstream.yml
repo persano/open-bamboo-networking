@@ -64,10 +64,9 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit new snapshot and open issue
+      - name: Commit new snapshot
         if: steps.compare.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
+        id: snapshot
         run: |
           cp /tmp/upstream_bambu_networking.hpp .github/upstream_watch.hpp
           cp /tmp/upstream.sha256 .github/upstream_watch.sha256
@@ -78,13 +77,25 @@ jobs:
           git push
 
           LATEST=$(grep -oE '[0-9]{2}\.[0-9]{2}\.[0-9]{2}' .github/upstream_watch.hpp | sort -V | tail -1)
-          SNAPSHOT_EXISTS=$([ -d "tools/abi_snapshot/v${LATEST}" ] && echo yes || echo no)
+          echo "latest=${LATEST}" >> "$GITHUB_OUTPUT"
+          if [ -d "tools/abi_snapshot/v${LATEST}" ]; then
+            echo "snapshot=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "snapshot=no" >> "$GITHUB_OUTPUT"
+          fi
 
+      # Best effort: keep working when the repository has issues disabled.
+      - name: Open issue
+        if: steps.compare.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           {
             echo "Official OrcaSlicer changed \`src/slic3r/Utils/bambu_networking.hpp\`."
             echo
-            echo "Newest series found in AVAILABLE_NETWORK_VERSIONS: \`${LATEST}\`"
-            echo "(ABI snapshot directory present: ${SNAPSHOT_EXISTS})."
+            echo "Newest series found in AVAILABLE_NETWORK_VERSIONS: \`${{ steps.snapshot.outputs.latest }}\`"
+            echo "(ABI snapshot directory present: ${{ steps.snapshot.outputs.snapshot }})."
             echo
             echo "Check the diff below; a struct or exported-function change needs a"
             echo "same-day rebuild of the plugin libraries, a pure version-row change"
@@ -97,16 +108,17 @@ jobs:
 
           gh issue create \
             --repo "$GITHUB_REPOSITORY" \
-            --title "upstream: OrcaSlicer bambu_networking.hpp changed (${LATEST})" \
+            --title "upstream: OrcaSlicer bambu_networking.hpp changed (${{ steps.snapshot.outputs.latest }})" \
             --body-file /tmp/issue.md
 
-          if [ "$SNAPSHOT_EXISTS" = yes ]; then
-            gh workflow run build.yml \
-              --repo "$GITHUB_REPOSITORY" \
-              -f abi="$LATEST" \
-              -f target_os=all \
-              -f arch=all
-            echo "Dispatched build.yml for abi=$LATEST"
-          else
-            echo "No ABI snapshot for $LATEST; skipped the build dispatch."
-          fi
+      - name: Dispatch ABI build
+        if: steps.compare.outputs.changed == 'true' && steps.snapshot.outputs.snapshot == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            -f abi="${{ steps.snapshot.outputs.latest }}" \
+            -f target_os=all \
+            -f arch=all
+          echo "Dispatched build.yml for abi=${{ steps.snapshot.outputs.latest }}"
