@@ -94,6 +94,10 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
         int p = std::atoi(val.c_str());
         if (p > 0 && p <= 65535) out.cloud_mqtt_port = p;
     }
+    else if (key == "cloud_os_type") {
+        const auto v = to_lower(val);
+        if (v == "windows" || v == "macos" || v == "linux") out.cloud_os_type = v;
+    }
     else if (key == "block_cloud")              out.block_cloud = truthy(val);
     else if (key == "cloud_hide_history")       out.cloud_hide_history = truthy(val);
     else if (key == "cloud_pushall_on_connect") out.cloud_pushall_on_connect = truthy(val);

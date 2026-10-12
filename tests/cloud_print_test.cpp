@@ -5,6 +5,7 @@
 // test_apply_mytask_pop.
 
 #include "obn/bambu_networking.hpp"
+#include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/print_job.hpp"
@@ -15,6 +16,7 @@
 #include <openssl/x509.h>
 
 #include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -989,6 +991,37 @@ static void test_mytask_pop_auto_follows_region()
 // main
 // ---------------------------------------------------------------------------
 
+static void test_cloud_platform_headers()
+{
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("obn-cloud-platform-" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(dir);
+    const std::string host = obn::cloud::os_type();
+    const struct { const char* config; std::string expected; } cases[] = {
+        {"", host},
+        {"cloud_os_type = windows\n", "windows"},
+        {"cloud_os_type = linux\n", "linux"},
+        {"cloud_os_type = macos\n", "macos"},
+        {" cloud_os_type = WINDOWS \n", "windows"},
+        {"cloud_os_type =\n", host},
+        {"cloud_os_type = invalid\n", host},
+    };
+    for (const auto& row : cases) {
+        {
+            std::ofstream out(dir / "obn.conf");
+            out << row.config;
+        }
+        obn::config::load_or_create(dir.string());
+        const auto headers = obn::cloud::bbl_headers("test-token", "test-user");
+        CHECK(headers.at("X-BBL-OS-Type") == row.expected);
+        CHECK(headers.at("X-BBL-Agent-OS-Type") == row.expected);
+        CHECK(headers.at("Authorization") == "Bearer test-token");
+        CHECK(obn::cloud::os_type() == host);
+    }
+    std::filesystem::remove_all(dir);
+}
+
 int main()
 {
     test_ams_mapping2_sentinel_from_flat();
@@ -1056,6 +1089,7 @@ int main()
     test_mytask_pop_on_without_material_is_noop();
     test_mytask_pop_on_with_material_attaches_pair();
     test_mytask_pop_auto_follows_region();
+    test_cloud_platform_headers();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);
