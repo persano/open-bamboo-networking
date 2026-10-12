@@ -63,6 +63,15 @@ std::string web_host(const std::string& region);
 // Compile-time OS identity for X-BBL-OS-Type ("windows" / "macos" / "linux").
 const char* os_type();
 
+// Platform implied by a slicer app-cert PEM chain: "windows" when the leaf
+// carries the Windows client identity (subject CN or O ending in
+// "-eed1e0410000"), "linux" for the Linux leaf ("-836763c70000"), nullptr
+// when the chain is absent, unparseable or belongs to neither. The cloud
+// binds each leaf to its platform on /user/ttcode and /my/task
+// (research/06.06, 10.02), and the leaf is what actually signs, so the
+// header has to follow the certificate rather than the host.
+const char* platform_for_leaf_pem(const std::string& pem);
+
 // Shared X-BBL headers captured from the stock plugin. Cloudflare in front of
 // api.bambulab.com is lenient about most X-BBL fields, but POST /my/task and
 // POST /iot-service/api/user/ttcode enforce two by VALUE: X-BBL-Client-Name

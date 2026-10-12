@@ -4,6 +4,10 @@
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/signing.hpp"
+
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 
 #include <map>
 #include <sstream>
@@ -66,8 +70,10 @@ std::string web_host(const std::string& region)
 
 const char* os_type()
 {
-    // POST /my/task rejects an OS mismatch with the uploader with HTTP 403,
-    // so this must reflect the real platform.
+    // Host platform, the fallback identity in bbl_headers(). POST /my/task
+    // rejects an OS mismatch with the leaf that signed the upload, so when a
+    // slicer cert is in play bbl_headers() follows platform_for_leaf_pem()
+    // instead and only reaches for this when there is no certificate.
 #if defined(_WIN32)
     return "windows";
 #elif defined(__APPLE__)
@@ -75,6 +81,42 @@ const char* os_type()
 #else
     return "linux";
 #endif
+}
+
+const char* platform_for_leaf_pem(const std::string& pem)
+{
+    // research/10.02-secrets.md: the app identities split per client OS, and
+    // the leaf CN/O is "<prefix>-<16 hex chars>0000" with the platform in the
+    // first half. Our embedded client_auth_secret is the Windows one, so the
+    // auto-provisioned leaf is the Windows leaf on every OS; a hand-placed
+    // Linux chain has to keep reporting linux.
+    if (pem.empty()) return nullptr;
+    BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
+    if (!bio) return nullptr;
+    X509* leaf = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    if (!leaf) return nullptr;
+    const char* result = nullptr;
+    char field[256];
+    const int nids[2] = {NID_commonName, NID_organizationName};
+    for (int i = 0; !result && i < 2; ++i) {
+        if (X509_NAME_get_text_by_NID(X509_get_subject_name(leaf), nids[i],
+                                      field, sizeof(field)) <= 0)
+            continue;
+        const std::string value{field};
+        const std::string suffix_windows = "-eed1e0410000";
+        const std::string suffix_linux   = "-836763c70000";
+        if (value.size() > suffix_windows.size() &&
+            value.compare(value.size() - suffix_windows.size(),
+                          suffix_windows.size(), suffix_windows) == 0)
+            result = "windows";
+        else if (value.size() > suffix_linux.size() &&
+                 value.compare(value.size() - suffix_linux.size(),
+                               suffix_linux.size(), suffix_linux) == 0)
+            result = "linux";
+    }
+    X509_free(leaf);
+    return result;
 }
 
 std::map<std::string, std::string> bbl_headers(const std::string& access_token,
@@ -98,7 +140,18 @@ std::map<std::string, std::string> bbl_headers(const std::string& access_token,
     h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"BambuStudio"}
                                                         : cfg_client_name;
     h["X-BBL-Client-Type"]    = "slicer";
-    const std::string platform = cfg.cloud_os_type.empty() ? os_type() : cfg.cloud_os_type;
+    // The cloud binds X-BBL-OS-Type to the signing leaf, and the leaf we hold
+    // is provisioned from an embedded Windows client_auth_secret on every OS,
+    // so the header follows the certificate rather than the host. Explicit
+    // obn.conf cloud_os_type wins, then the leaf, then the host.
+    std::string platform = cfg.cloud_os_type;
+    if (platform.empty()) {
+        if (const char* leaf = platform_for_leaf_pem(obn::signing::slicer_cert_pem()))
+            platform = leaf;
+    }
+    if (platform.empty()) platform = os_type();
+    OBN_DEBUG("bbl_headers: X-BBL-OS-Type=%s (config '%s')", platform.c_str(),
+              cfg.cloud_os_type.c_str());
     h["X-BBL-OS-Type"]        = platform;
     h["X-BBL-Agent-OS-Type"]  = platform;
     h["X-BBL-Language"]       = "en-US";

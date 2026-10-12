@@ -11,8 +11,10 @@
 #include "obn/print_job.hpp"
 #include "obn/signing.hpp"
 
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
 #include <openssl/x509.h>
 
 #include <cstdio>
@@ -991,6 +993,83 @@ static void test_mytask_pop_auto_follows_region()
 // main
 // ---------------------------------------------------------------------------
 
+// Shared throwaway key: a leaf needs a subject public key to serialize, and
+// platform_for_leaf_pem() never looks at it.
+static EVP_PKEY* test_leaf_key()
+{
+    static EVP_PKEY* key = [] {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        return EVP_RSA_gen(2048);
+#else
+        RSA* rsa = RSA_new();
+        BIGNUM* bn = BN_new();
+        BN_set_word(bn, RSA_F4);
+        RSA_generate_key_ex(rsa, 2048, bn, nullptr);
+        BN_free(bn);
+        EVP_PKEY* pk = EVP_PKEY_new();
+        EVP_PKEY_assign_RSA(pk, rsa);
+        return pk;
+#endif
+    }();
+    return key;
+}
+
+// Minimal self-signed leaf carrying `value` in `field` (subject CN or O,
+// the two shapes the real app leaves use). platform_for_leaf_pem() only
+// reads the subject.
+static std::string make_leaf_pem(const std::string& value,
+                                 const char* field = "CN")
+{
+    X509* x = X509_new();
+    if (!x) return {};
+    X509_set_version(x, 2);
+    ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+    X509_gmtime_adj(X509_get_notBefore(x), 0);
+    X509_gmtime_adj(X509_get_notAfter(x), 60L * 60 * 24 * 365);
+    X509_NAME* name = X509_get_subject_name(x);
+    X509_NAME_add_entry_by_txt(name, field, MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(value.c_str()),
+                               -1, -1, 0);
+    X509_set_subject_name(x, name);
+    X509_set_issuer_name(x, name);
+    X509_set_pubkey(x, test_leaf_key());
+    X509_sign(x, test_leaf_key(), EVP_sha256());
+    BIO* bio = BIO_new(BIO_s_mem());
+    PEM_write_bio_X509(bio, x);
+    PEM_write_bio_X509(bio, x);
+    char* data = nullptr;
+    const long len = BIO_get_mem_data(bio, &data);
+    const std::string pem(data, data + len);
+    BIO_free(bio);
+    X509_free(x);
+    return pem;
+}
+
+static std::string platform_or_empty(const std::string& pem)
+{
+    const char* p = obn::cloud::platform_for_leaf_pem(pem);
+    return p ? std::string{p} : std::string{};
+}
+
+static void test_platform_for_leaf_pem()
+{
+    CHECK(platform_or_empty("") == "");
+    CHECK(platform_or_empty("not a pem") == "");
+    const std::string windows_leaf = make_leaf_pem("GLOF3813734089-eed1e0410000");
+    const std::string linux_leaf   = make_leaf_pem("GLOF3813734089-836763c70000");
+    CHECK(!windows_leaf.empty());
+    CHECK(!linux_leaf.empty());
+    CHECK(platform_or_empty(windows_leaf) == "windows");
+    CHECK(platform_or_empty(linux_leaf) == "linux");
+    // The organization carries the marker on the real leaves (research/10.02).
+    CHECK(platform_or_empty(make_leaf_pem("GLOF3813734089-eed1e0410000", "O")) == "windows");
+    // Unknown / short identities fail to the caller's host fallback.
+    CHECK(platform_or_empty(make_leaf_pem("GLOF3813734089-deadbeef0000")) == "");
+    CHECK(platform_or_empty(make_leaf_pem("eed1e0410000")) == "");
+    // Only the first block (the leaf) decides a chain.
+    CHECK(platform_or_empty(windows_leaf + linux_leaf) == "windows");
+}
+
 static void test_cloud_platform_headers()
 {
     const auto dir = std::filesystem::temp_directory_path() /
@@ -1018,6 +1097,29 @@ static void test_cloud_platform_headers()
         CHECK(headers.at("X-BBL-Agent-OS-Type") == row.expected);
         CHECK(headers.at("Authorization") == "Bearer test-token");
         CHECK(obn::cloud::os_type() == host);
+    }
+    // Without a config override the signing leaf decides: the cloud binds
+    // X-BBL-OS-Type to the leaf that signs, and the auto-provisioned leaf is
+    // the Windows one on every OS (embedded client_auth_secret).
+    const struct { std::string leaf_cn; std::string config; std::string expected; } cert_cases[] = {
+        {"GLOF3813734089-eed1e0410000", "", "windows"},
+        {"GLOF3813734089-836763c70000", "", "linux"},
+        {"GLOF3813734089-deadbeef0000", "", host},
+        {"GLOF3813734089-836763c70000", "cloud_os_type = windows\n", "windows"},
+    };
+    for (const auto& row : cert_cases) {
+        {
+            std::ofstream out(dir / "obn.conf");
+            out << row.config;
+        }
+        {
+            std::ofstream out(dir / "slicer_cert.pem");
+            out << make_leaf_pem(row.leaf_cn);
+        }
+        obn::config::load_or_create(dir.string());
+        const auto headers = obn::cloud::bbl_headers("test-token", "test-user");
+        CHECK(headers.at("X-BBL-OS-Type") == row.expected);
+        CHECK(headers.at("X-BBL-Agent-OS-Type") == row.expected);
     }
     std::filesystem::remove_all(dir);
 }
@@ -1089,6 +1191,7 @@ int main()
     test_mytask_pop_on_without_material_is_noop();
     test_mytask_pop_on_with_material_attaches_pair();
     test_mytask_pop_auto_follows_region();
+    test_platform_for_leaf_pem();
     test_cloud_platform_headers();
 
     if (fail_count) {

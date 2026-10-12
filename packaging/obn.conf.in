@@ -246,12 +246,14 @@ slicer_crl_pem =
 client_name = BambuStudio
 
 # Platform identity for cloud REST calls: windows, linux or macos.
-# Empty (default) or unrecognized values use the host OS. Match this to
-# the signing certificate's platform when using a certificate provisioned
-# for another OS; a mismatch can cause HTTP 403 on print and camera calls.
-# Uploads and dispatch must use the same identity, so restart the slicer
-# and upload again after changing it. This does not change LAN behavior
-# or enable signing: mytask_pop still controls print proof-of-possession.
+# Empty (default) or unrecognized values take the platform of the signing
+# certificate (slicer_cert.pem), and only fall back to the host OS when
+# there is no certificate at all. The cloud binds each certificate to its
+# platform, so a mismatch answers HTTP 403 on print and camera calls.
+# Set this only to override what the certificate says; uploads and
+# dispatch must use the same identity, so restart the slicer and upload
+# again after changing it. This does not change LAN behavior or enable
+# signing: mytask_pop still controls print proof-of-possession.
 # See research/06.06-cloud-rest.md for the certificate/platform matrix.
 
 cloud_os_type =
