@@ -98,8 +98,9 @@ std::map<std::string, std::string> bbl_headers(const std::string& access_token,
     h["X-BBL-Client-Name"]    = cfg_client_name.empty() ? std::string{"BambuStudio"}
                                                         : cfg_client_name;
     h["X-BBL-Client-Type"]    = "slicer";
-    h["X-BBL-OS-Type"]        = os_type();
-    h["X-BBL-Agent-OS-Type"]  = os_type();
+    const std::string platform = cfg.cloud_os_type.empty() ? os_type() : cfg.cloud_os_type;
+    h["X-BBL-OS-Type"]        = platform;
+    h["X-BBL-Agent-OS-Type"]  = platform;
     h["X-BBL-Language"]       = "en-US";
     h["X-BBL-Executable-info"] = cfg.executable_info.empty()
                                      ? std::string{kStockExecutableInfo}

@@ -119,6 +119,9 @@ struct Settings {
     // live view. Empty falls back to "BambuStudio" in bbl_headers().
     std::string client_name;
 
+    // Cloud identity must match the signing certificate's platform.
+    std::string cloud_os_type;
+
     // Value sent in `X-BBL-Executable-info` on cloud REST calls. Bambu's
     // cloud validates the JSON contents (hash_value, serial_number, ...) and
     // answers 403 when they do not match a known Studio build, so empty
