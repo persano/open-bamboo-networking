@@ -632,6 +632,8 @@ bool slicer_app_cert_usable()
     static bool warned_cert_dates = false;
     static bool warned_crl_dates = false;
     static bool warned_revoked = false;
+    // Logged once on the first successful check (Studio calls ~1 Hz).
+    static bool logged_cert_id = false;
 
     const std::string pem = slicer_cert_pem();
     if (pem.empty()) return false;
@@ -699,6 +701,15 @@ bool slicer_app_cert_usable()
 
     ::X509_CRL_free(crl);
     ::X509_free(cert);
+
+    if (!logged_cert_id) {
+        logged_cert_id = true;
+        const std::string id = slicer_cert_id();
+        if (id.empty())
+            OBN_WARN("signing: slicer app certificate loaded but cert_id is empty");
+        else
+            OBN_INFO("signing: slicer app certificate id %s", id.c_str());
+    }
     return true;
 }
 
