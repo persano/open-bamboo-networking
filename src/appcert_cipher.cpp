@@ -40,10 +40,13 @@
 //   5. Replace kClientAuthSecret below with the new 43 bytes (they are
 //      ASCII; keep it a C string) and record the extraction date here.
 //
-// ALTERNATIVE (no embedded secret): copy slicer_cert.pem / slicer_crl.pem /
-// slicer_key.pem out of a licensed Bambu Studio config dir into ours (see
-// README). That path needs a manual refresh whenever Bambu rotates the
-// certificate; the fetch implemented here does not.
+// ALTERNATIVE (no embedded secret): the user supplies slicer_cert.pem /
+// slicer_crl.pem / slicer_key.pem in the obn config dir (signing.cpp reads
+// them; see README). Note stock Bambu Studio never writes those files itself,
+// so in practice they only come from running tools/extract_key_from_dump.py
+// (or its companion fetch) against the user's own Bambu Studio process. That
+// path needs a manual refresh whenever Bambu rotates the certificate; the
+// fetch implemented here does not.
 //
 // The cipher itself is Bambu's published appcert_cipher (custom S-box AES-
 // 256-CTR over fixed key 00..1f, counter from 2) — ported 1:1 from
