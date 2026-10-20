@@ -755,6 +755,14 @@ bool apply_mytask_pop(std::map<std::string, std::string>& hdrs,
     return true;
 }
 
+// A 403 on the bearer-only request is the only signal worth a retry with
+// more headers: H2D printers answer 403 on /my/task without the
+// proof-of-possession pair on every cloud region (issue #6, user reports;
+// mytask_pop=auto only attaches on CN), while any other status means the
+// failure has another cause that extra headers will not fix.
+bool should_retry_mytask_pop(int status_code, bool pop_attached)
+{ return status_code == 403 && !pop_attached; }
+
 int create_task(const std::string& api, const std::string& region,
                 const std::string& token,
                 const std::string& user_id,
@@ -780,12 +788,24 @@ int create_task(const std::string& api, const std::string& region,
                  "BambuStudio; /my/task answers 403 for it (obn.conf "
                  "client_name, see research/06.06-cloud-rest.md)",
                  hdrs["X-BBL-Client-Name"].c_str());
-    apply_mytask_pop(hdrs, region);
+    const bool pop_attached = apply_mytask_pop(hdrs, region);
     req.headers   = std::move(hdrs);
     req.body      = body;
     req.timeout_s = 60;
 
     auto resp = obn::http::perform(req);
+
+    // The H2D (at least) 403s the bearer-only variant of this request on
+    // every region, so when the pair was omitted and the cloud answers
+    // 403, attach it and retry once. The retry is best-effort; if
+    // the signing material is unusable the original 403 stands and
+    // fail_stage below reports it unchanged.
+    if (should_retry_mytask_pop(resp.status_code, pop_attached) &&
+        obn::signing::add_pop_headers(req.headers)) {
+        OBN_INFO("cloud_print: create_task got 403 without PoP headers; "
+                 "retrying once with the proof-of-possession pair");
+        resp = obn::http::perform(req);
+    }
 
     // Hard-fail on any transport error or non-2xx: POST /my/task registers the
     // print with MakerWorld and, for cloud prints, is what actually authorizes
@@ -851,6 +871,8 @@ std::string test_md5_file_hex_upper(const std::string& path)
 bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs,
                            const std::string& region)
     { return apply_mytask_pop(hdrs, region); }
+bool test_should_retry_mytask_pop(int status_code, bool pop_attached)
+    { return should_retry_mytask_pop(status_code, pop_attached); }
 } // namespace cloud_print
 #endif
 

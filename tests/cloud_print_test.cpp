@@ -34,6 +34,7 @@ namespace obn::cloud_print {
     std::string test_md5_file_hex_upper(const std::string& path);
     bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs,
                                const std::string& region);
+    bool test_should_retry_mytask_pop(int status_code, bool pop_attached);
 }
 
 static int fail_count = 0;
@@ -989,6 +990,17 @@ static void test_mytask_pop_auto_follows_region()
     std::filesystem::remove_all(dir);
 }
 
+static void test_should_retry_mytask_pop_decision()
+{
+    // 403 without the pair is the H2D case worth one retry (issue #6);
+    // every other combination must fail through to the caller's error.
+    CHECK(obn::cloud_print::test_should_retry_mytask_pop(403, false));
+    CHECK(!obn::cloud_print::test_should_retry_mytask_pop(403, true));
+    CHECK(!obn::cloud_print::test_should_retry_mytask_pop(200, false));
+    CHECK(!obn::cloud_print::test_should_retry_mytask_pop(400, false));
+    CHECK(!obn::cloud_print::test_should_retry_mytask_pop(500, false));
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -1191,6 +1203,7 @@ int main()
     test_mytask_pop_on_without_material_is_noop();
     test_mytask_pop_on_with_material_attaches_pair();
     test_mytask_pop_auto_follows_region();
+    test_should_retry_mytask_pop_decision();
     test_platform_for_leaf_pem();
     test_cloud_platform_headers();
 
