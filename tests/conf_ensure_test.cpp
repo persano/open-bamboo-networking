@@ -1,8 +1,12 @@
-// ensure_block_cloud_off() + the obn_ensure_conf_block_cloud() export the
-// plugin installer calls once OrcaSlicer's audit hard-denies every Python
-// open() of a "*.conf" path. The semantics mirror ensure_obn_conf() in
+// ensure_block_cloud_off(), ensure_conf_fixes() and their obn_ensure_conf_*
+// exports the plugin installer calls once OrcaSlicer's audit hard-denies
+// every Python open() of a "*.conf" path. The semantics mirror
+// ensure_obn_conf() / ensure_log_to_file() / ensure_client_name() in
 // open_bambu_networking.py: truthy key -> rewrite to 0, no key -> append the
-// documented block, key already off -> file untouched, other lines preserved.
+// documented block, key already off -> file untouched, other lines preserved;
+// log_to_file present -> value untouched (explicit 0 stays off), missing ->
+// appended as 1; client_name only rewrites the shipped OpenBambooNetworking
+// value.
 
 #include "obn/config.hpp"
 
@@ -16,6 +20,7 @@
 namespace fs = std::filesystem;
 
 extern "C" int obn_ensure_conf_block_cloud(const char* conf_path);
+extern "C" int obn_ensure_conf_fixes(const char* conf_path);
 
 #define CHECK(cond)                                                     \
     do {                                                                \
@@ -195,6 +200,74 @@ static int test_abi_export_roundtrip()
     return 0;
 }
 
+// A pre-0.2.28 Python-installer conf: block already off, the shipped
+// client_name value still there, no log_to_file key. All three fixes in one
+// pass: block unchanged (0), log appended (1 byte), client rewritten (2 byte).
+static int test_fixes_legacy_conf()
+{
+    const fs::path dir  = make_temp_dir();
+    const fs::path path = dir / obn::config::kConfigFileName;
+    write_conf(path,
+               "# Open Bamboo Networking configuration\n"
+               "block_cloud = 0\n"
+               "client_name = OpenBambooNetworking\n");
+    const int packed = obn_ensure_conf_fixes(path.string().c_str());
+    CHECK(packed == (0 | (1 << 8) | (1 << 16)));
+    const std::string body = read_conf(path);
+    CHECK(body.find("client_name = BambuStudio\n") != std::string::npos);
+    CHECK(body.find("log_to_file = 1\n") != std::string::npos);
+    CHECK(body.find("# Open Bamboo Networking configuration\n") != std::string::npos);
+    return 0;
+}
+
+// Values the user picked are never touched: block_cloud is forced off, but
+// an explicit log_to_file = 0 stays off and a custom client_name stays.
+static int test_fixes_user_values_kept()
+{
+    const fs::path dir  = make_temp_dir();
+    const fs::path path = dir / obn::config::kConfigFileName;
+    write_conf(path,
+               "block_cloud = 1\n"
+               "log_to_file = 0\n"
+               "client_name = MyCustom\n");
+    const int packed = obn_ensure_conf_fixes(path.string().c_str());
+    CHECK(packed == 2); // Set, log untouched, client untouched
+    const std::string body = read_conf(path);
+    CHECK(body.find("block_cloud = 0\n") != std::string::npos);
+    CHECK(body.find("log_to_file = 0\n") != std::string::npos);
+    CHECK(body.find("client_name = MyCustom\n") != std::string::npos);
+    return 0;
+}
+
+// Fresh file: the template (block_cloud = 1, log_to_file = 0,
+// client_name = BambuStudio) is created and the block fix applied, reported
+// as Created like ensure_block_cloud_off(); the template's log_to_file = 0
+// becomes 1 (a fresh file means the user chose nothing, matching what the
+// Python fresh path writes), client_name is already BambuStudio so byte 2
+// stays 0.
+static int test_fixes_fresh_file()
+{
+    const fs::path dir  = make_temp_dir();
+    const fs::path path = dir / obn::config::kConfigFileName;
+    CHECK(!fs::exists(path));
+    const int packed = obn_ensure_conf_fixes(path.string().c_str());
+    CHECK(packed == (1 | (1 << 8))); // Created, log enabled, client untouched
+    CHECK(fs::exists(path));
+    const std::string body = read_conf(path);
+    CHECK(body.find("block_cloud = 0\n") != std::string::npos);
+    CHECK(body.find("log_to_file = 1\n") != std::string::npos);
+    CHECK(body.find("client_name = BambuStudio\n") != std::string::npos);
+    return 0;
+}
+
+static int test_fixes_error_paths()
+{
+    CHECK(obn::config::ensure_conf_fixes("") == -1);
+    CHECK(obn_ensure_conf_fixes(nullptr) == -1);
+    CHECK(obn_ensure_conf_fixes("") == -1);
+    return 0;
+}
+
 int main()
 {
     if (test_missing_file_created() != 0) return 1;
@@ -208,6 +281,10 @@ int main()
     if (test_existing_empty_file_appended() != 0) return 1;
     if (test_empty_path_is_error() != 0) return 1;
     if (test_abi_export_roundtrip() != 0) return 1;
+    if (test_fixes_legacy_conf() != 0) return 1;
+    if (test_fixes_user_values_kept() != 0) return 1;
+    if (test_fixes_fresh_file() != 0) return 1;
+    if (test_fixes_error_paths() != 0) return 1;
 
     std::cout << "conf_ensure_test: ok\n";
     return 0;

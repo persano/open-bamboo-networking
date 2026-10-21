@@ -177,6 +177,26 @@ enum class EnsureOutcome {
 // Python audit hook. Returns Error when the path is empty or a write fails.
 EnsureOutcome ensure_block_cloud_off(const std::string& conf_path);
 
+// The installer's whole obn.conf pass -- block_cloud, log_to_file and
+// client_name -- in one read/write, for OrcaSlicer builds whose plugin audit
+// denies every Python open() of a path containing "conf" (see the block on
+// ensure_block_cloud_off()). Each fix mirrors its Python counterpart so a
+// machine where both could run observes one behavior: byte 0 is the
+// block_cloud EnsureOutcome (Created when this call created the file, even
+// though the template write also ran the block fix), byte 1 is 0 when
+// log_to_file is already present (value untouched: an explicit = 0 stays off,
+// ensure_log_to_file()) or 1 when the missing key was appended as
+// `log_to_file = 1` -- or, on a file this call just created from the shipped
+// template, when the template's `log_to_file = 0` was set to 1 (a fresh file
+// means the user chose nothing, and the Python fresh path ends with logging
+// on), byte 2 is 0 when client_name is absent, already
+// BambuStudio, or a user-picked value (all left alone, ensure_client_name())
+// or 1 when the shipped `OpenBambooNetworking` template value was rewritten
+// to `BambuStudio`. Returns -1 when the path is empty or the file could not
+// be read/written; on -1 no partial outcome is reported and the installer
+// falls back to its own messages.
+int ensure_conf_fixes(const std::string& conf_path);
+
 // Load from <config_dir>/obn.conf; create a commented template if missing.
 // Thread-safe; subsequent calls return the same cached Settings until
 // load_or_create is called with a different non-empty directory.

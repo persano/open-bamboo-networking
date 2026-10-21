@@ -314,6 +314,84 @@ EnsureOutcome ensure_block_cloud_in_file(const std::filesystem::path& path)
     return write_atomic(path, joined) ? outcome : EnsureOutcome::Error;
 }
 
+// Value spans of a non-comment `key = value` line, matching the Python
+// installer's ^\s*key\s*=\s*([^\s#]+): spaces before/after '=' optional,
+// the value stops at whitespace or '#', comments never match.
+bool find_key_value(std::string_view content, std::string_view key,
+                    std::size_t& vstart, std::size_t& vend)
+{
+    std::size_t i = 0;
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    if (i >= content.size() || content[i] == '#') return false;
+    if (content.compare(i, key.size(), key) != 0) return false;
+    i += key.size();
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    if (i >= content.size() || content[i] != '=') return false;
+    ++i;
+    while (i < content.size() && std::isspace(static_cast<unsigned char>(content[i]))) ++i;
+    vstart = i;
+    while (i < content.size() && !std::isspace(static_cast<unsigned char>(content[i]))
+           && content[i] != '#') ++i;
+    vend = i;
+    return i > vstart;
+}
+
+// Byte 1 semantics: 0 = the key was already present and its value is
+// untouched (an explicit log_to_file = 0 stays off -- ensure_log_to_file()
+// keeps user values), 1 = the key was missing and `log_to_file = 1` was
+// appended with the same blank-line rule the Python path uses. When
+// installer_default is set (the file was just created from the shipped
+// template in this call), a present template value of 0 is rewritten to 1
+// as well: a brand new file means the user chose nothing, and the Python
+// fresh path ends with log_to_file = 1 (it writes a keyless header, then
+// appends the key).
+int fix_log_to_file(std::vector<std::string>& lines, bool installer_default)
+{
+    std::size_t vstart = 0, vend = 0;
+    for (std::string& line : lines) {
+        const std::string_view content = strip_eol(line);
+        if (!find_key_value(content, "log_to_file", vstart, vend)) continue;
+        if (!installer_default) return 0;
+        const std::string_view value = content.substr(vstart, vend - vstart);
+        if (truthy(std::string(value))) return 0;
+        line.replace(vstart, vend - vstart, "1");
+        return 1;
+    }
+
+    if (!lines.empty()) {
+        std::string& last = lines.back();
+        if (last.empty() || last.back() != '\n') last += '\n';
+        if (!strip_eol(last).empty()) lines.push_back("\n");
+    }
+    lines.push_back("log_to_file = 1\n");
+    return 1;
+}
+
+// 0 = unchanged: key absent (the library default is already BambuStudio) or
+// a value the installer must not override. 1 = the shipped pre-0.2.28
+// template value rewritten to BambuStudio; only that value is rewritten
+// (surrounding double quotes stripped for the comparison, first key line
+// wins) -- ensure_client_name() in open_bambu_networking.py.
+int fix_client_name(std::vector<std::string>& lines)
+{
+    for (std::string& line : lines) {
+        const std::string_view content = strip_eol(line);
+        std::size_t vstart = 0, vend = 0;
+        if (!find_key_value(content, "client_name", vstart, vend)) continue;
+
+        std::string_view value = content.substr(vstart, vend - vstart);
+        const std::size_t first = value.find_first_not_of('"');
+        const std::size_t last  = value.find_last_not_of('"');
+        if (first != std::string_view::npos)
+            value = value.substr(first, last - first + 1);
+        if (to_lower(std::string(value)) != "openbamboonetworking") return 0;
+
+        line.replace(vstart, vend - vstart, "BambuStudio");
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 bool is_cn_region(const std::string& region)
@@ -347,6 +425,42 @@ EnsureOutcome ensure_block_cloud_off(const std::string& conf_path)
                                                : EnsureOutcome::Created;
     }
     return ensure_block_cloud_in_file(path);
+}
+
+int ensure_conf_fixes(const std::string& conf_path)
+{
+    if (conf_path.empty()) return -1;
+    // u8path: the plugin passes os.fsencode()-d UTF-8 bytes (PEP 529).
+    const std::filesystem::path path = std::filesystem::u8path(conf_path);
+
+    std::error_code ec;
+    const bool exists = std::filesystem::is_regular_file(path, ec);
+    if (!exists && !write_default_template(path)) return -1;
+
+    std::string data;
+    if (!read_all(path, data)) return -1;
+    std::vector<std::string> lines = split_lines_keep_ends(data);
+
+    bool       changed = false;
+    EnsureOutcome block = fix_lines(lines);
+    if (block == EnsureOutcome::Set || block == EnsureOutcome::Appended)
+        changed = true;
+    // The template ships block_cloud = 1; the fix above already ran on it,
+    // but Created is what the installer announces for a fresh file (the same
+    // override ensure_block_cloud_off() applies).
+    if (!exists) block = EnsureOutcome::Created;
+
+    const int log = fix_log_to_file(lines, /*installer_default=*/!exists);
+    if (log) changed = true;
+    const int client = fix_client_name(lines);
+    if (client) changed = true;
+
+    if (changed) {
+        std::string joined;
+        for (const std::string& line : lines) joined += line;
+        if (!write_atomic(path, joined)) return -1;
+    }
+    return static_cast<int>(block) | (log << 8) | (client << 16);
 }
 
 Settings load_or_create(const std::string& config_dir)
@@ -474,4 +588,14 @@ OBN_ABI int obn_ensure_conf_block_cloud(const char* conf_path)
 {
     if (!conf_path) return -1;
     return static_cast<int>(obn::config::ensure_block_cloud_off(conf_path));
+}
+
+// Whole-pass sibling of obn_ensure_conf_block_cloud(): the installer calls
+// this first and unpacks the three per-fix outcomes (layout documented on
+// config::ensure_conf_fixes()), so on audit-blocking builds client_name and
+// log_to_file get the same native treatment block_cloud already had.
+OBN_ABI int obn_ensure_conf_fixes(const char* conf_path)
+{
+    if (!conf_path) return -1;
+    return obn::config::ensure_conf_fixes(conf_path);
 }
