@@ -4,8 +4,8 @@
 // D-07 header note (requirement-letter-vs-reality deviation, recorded per the
 // Phase 2 precedent): this file follows the repo convention (int main() +
 // fail_count + CHECK), NOT Catch2 — REQUIREMENTS calls the new case a
-// "Catch2 test", but only ssdp_listener_test.cpp is actually Catch2 in this
-// tree; Catch2 conversion of this file is deferred (test-infrastructure work).
+// "Catch2 test"; no test in this tree uses Catch2 anymore (ssdp_listener_test
+// adopted upstream's plain main()+CHECK suite), so this file stays as-is.
 
 #include "obn/signing.hpp"
 #include "obn/config.hpp"

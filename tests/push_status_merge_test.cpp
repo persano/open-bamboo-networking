@@ -28,8 +28,10 @@
 // (Pitfall 11).
 //
 // Framework: repo convention (int main() + fail_count + CHECK, as in
-// json_lite_test.cpp) — the OQ-1 checkpoint decision (02-02, route b2,
-// Catch2) applied to the converted ssdp_listener_test.cpp; the research
+// json_lite_test.cpp) - the OQ-1 checkpoint decision (02-02, route b2,
+// Catch2) applied to the converted ssdp_listener_test.cpp (that
+// conversion was later superseded by upstream's plain main()+CHECK
+// rewrite; no test uses Catch2 now); the research
 // default for this new file is the repo's own macro skeleton.
 
 #include "obn/json_lite.hpp"
