@@ -77,7 +77,10 @@ and the config location, then picks sensible defaults for a typical user.
 
 `make uninstall` walks the install manifest and removes whatever was put
 down; `make clean` / `make distclean` drop build artefacts; `make test`
-runs the smoke tests via `ctest`.
+runs the smoke tests via `ctest`. Each test fails if it runs longer than
+60 seconds; to change that, add `--cmake-arg=-DOBN_TEST_TIMEOUT=<seconds>`
+to your `./configure --enable-tests ...` call (`0` sets no per-test limit;
+`ctest --test-dir build --timeout <seconds>` can then set one).
 
 #### `./configure` options
 
@@ -235,11 +238,13 @@ Here `client_name` is `BambuStudio` or `OrcaSlicer`, and `namespace` is `com.bam
 - **Bambu Studio:** also place `network_plugins.json` in `ota/plugins` (alongside the `plugins` directory).
 - **Orca Slicer:** rename `libbambu_networking.so` (or `bambu_networking.dll` on Windows) so the filename includes the plugin version, e.g. `libbambu_networking_02.03.00.99.so`.
 
+**macOS (both slicers):** after copying, ad-hoc sign each copied library, e.g. `codesign --force -s - "<dest>/libbambu_networking.dylib"` (Orca: `libbambu_networking_<version>.dylib`), the same for `libBambuSource.dylib`, and for `liblive555.dylib` only if you copied the stub. The release libraries are linker-signed without a CMS blob and macOS syspolicyd reports them as unsigned (-67062) on first load; a codesign ad-hoc signature is evaluated on the regular "adhoc" path instead. Best-effort hardening --- `install.sh` does this automatically.
+
 Then edit the configuration file.
 
 **Bambu Studio** — `BambuStudio.conf` (under the `app` object):
 
-  - set `"installed_networking"` to `"1"` (mark the plugin as installed)
+  - set `"installed_networking"` to `"0"` (NOT `"1"`: with `"1"`, a single failed load of one plugin component makes Studio silently re-download and reinstall the stock plugin during that same start-up)
   - set `"update_network_plugin"` to `"false"` (avoid auto-update replacing it with the stock plugin)
   - on **Windows** and **macOS**, set `ignore_module_cert` to `"1"` to skip publisher / certificate validation for the plugin
 

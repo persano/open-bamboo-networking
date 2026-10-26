@@ -206,7 +206,7 @@ endif()
 # When ON, 'cmake --install' (and therefore 'make install') will also
 # edit the slicer's conf file so it trusts this plugin:
 #   bambu_studio -> ~/.config/BambuStudio/BambuStudio.conf
-#                   ("installed_networking"="1", "update_network_plugin"="false")
+#                   ("installed_networking"="0", "update_network_plugin"="false")
 #   orca_slicer  -> ~/.config/OrcaSlicer/OrcaSlicer.conf (or the Flatpak
 #                   path) -- "installed_networking"="true",
 #                   "network_plugin_version"="<OBN_VERSION>",
@@ -759,6 +759,32 @@ endif()
 option(OBN_BUILD_TESTS "Build smoke tests" OFF)
 if(OBN_BUILD_TESTS)
     enable_testing()
+
+    # A hung test must fail on its own instead of running until a CI time limit.
+    set(OBN_TEST_TIMEOUT 60 CACHE STRING
+        "Per-test ctest TIMEOUT in seconds; 0 leaves it to ctest --timeout")
+    if(NOT OBN_TEST_TIMEOUT MATCHES "^[0-9]+$")
+        # ctest would read "abc" as no limit and "1m" as one second.
+        message(FATAL_ERROR "OBN_TEST_TIMEOUT must be a whole number of "
+            "seconds, got '${OBN_TEST_TIMEOUT}'")
+    endif()
+    # Deferred to the end of this file so later add_test() calls are covered.
+    function(obn_apply_default_test_timeout)
+        get_property(_obn_tests DIRECTORY PROPERTY TESTS)
+        foreach(_obn_test IN LISTS _obn_tests)
+            get_property(_obn_has_timeout TEST ${_obn_test}
+                PROPERTY TIMEOUT SET)
+            if(NOT _obn_has_timeout)
+                set_tests_properties(${_obn_test} PROPERTIES
+                    TIMEOUT ${OBN_TEST_TIMEOUT})
+            endif()
+        endforeach()
+    endfunction()
+    # An explicit TIMEOUT 0 would also switch off `ctest --timeout`.
+    if(OBN_TEST_TIMEOUT GREATER 0)
+        cmake_language(DEFER CALL obn_apply_default_test_timeout)
+    endif()
+
     # probe_plugin is cross-platform: dlopen/dlsym on POSIX,
     # LoadLibrary/GetProcAddress on Windows. It also exercises
     # bambu_network_create_agent so the heap and std::string ABI
@@ -871,32 +897,18 @@ if(OBN_BUILD_TESTS)
     endif()
     add_test(NAME conf_ensure COMMAND conf_ensure_test)
 
-    # DOC-01 golden-fixture suite for the SSDP parser. Catch2 comes in via
-    # FetchContent pinned to a fixed release tag (checkpoint OQ-1 route b2):
-    # reproducible, no vendored framework header, no package-manager install.
-    # Catch2 detects itself as a subproject here, and its own tests/docs are
-    # additionally forced off.
-    set(CATCH_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
-    set(CATCH_INSTALL_HELPERS OFF CACHE BOOL "" FORCE)
-    include(FetchContent)
-    FetchContent_Declare(Catch2
-        GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG        v2.13.10)
-    FetchContent_MakeAvailable(Catch2)
-
-    # Hermetic (no socket) golden-fixture test over tests/fixtures/ssdp/.
-    # WORKING_DIRECTORY is how fixtures resolve at runtime — not a compile
-    # definition, because the workspace path contains a space (D-08).
-    # src/json_lite.cpp is linked because the test parses the emitted
-    # device JSON with obn::json::parse (not used by ssdp.cpp itself).
+    # DOC-01 golden-fixture suite for the SSDP parser: plain main()+CHECK
+    # (json_lite_test.cpp style), no test framework in the configure step.
+    # Hermetic (no socket). WORKING_DIRECTORY is how fixtures resolve at
+    # runtime — not a compile definition, because the workspace path contains
+    # a space (D-08). src/json_lite.cpp is linked because the test parses the
+    # emitted device JSON with obn::json::parse (not used by ssdp.cpp itself).
     add_executable(ssdp_listener_test tests/ssdp_listener_test.cpp
         src/json_lite.cpp
         src/log.cpp
         src/os_compat.cpp
         src/ssdp.cpp)
     target_include_directories(ssdp_listener_test PRIVATE include)
-    target_link_libraries(ssdp_listener_test PRIVATE Catch2::Catch2)
     if(WIN32)
         # log.cpp needs os_compat.cpp for strcasecmp_portable, and that
         # translation unit also holds the Winsock wrappers — mirror
@@ -1220,7 +1232,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
 
     # In-process tests for obn::Agent itself: SSDP bind-detect lookup,
     # firmware JSON rendering, synthetic subtask ids and the selected-printer
-    # memory from issue #78. No sockets are opened.
+    # memory from issue #78. No printer is contacted, but the SSDP listener
+    # (UDP 2021) and the loopback cover_server are started and stopped.
     add_executable(agent_test tests/agent_test.cpp
         ${OBN_TEST_CORE_SOURCES})
     target_include_directories(agent_test PRIVATE include ${OBN_GENERATED_DIR})

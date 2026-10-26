@@ -244,11 +244,27 @@ bool wire_chunk_is_image(const std::vector<std::uint8_t>& chunk)
     return chunk.size() >= 2 && chunk[0] == 0xff && chunk[1] == 0xd8;
 }
 
+// Position of the reply's "reply.path" in `paths`; paths.size() when the
+// reply names none of them.
+std::size_t sub_file_reply_rank(const std::string&              wire_json,
+                                const std::vector<std::string>& paths)
+{
+    std::string perr;
+    const auto root = obn::json::parse(wire_json, &perr);
+    if (!root) return paths.size();
+    const std::string path = root->find("reply.path").as_string();
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (paths[i] == path) return i;
+    }
+    return paths.size();
+}
+
 SubFileOutcome run_sub_file(obn::tunnel_local::Session* session,
                             SSL* ssl, std::mutex* io_mu, std::uint32_t seq,
                             const SubFileRequest& req)
 {
     SubFileOutcome out;
+    std::size_t    best_rank = 0;  // rank of out.data when it is set
     if (req.paths.empty()) {
         out.error = "missing sub_file paths";
         return out;
@@ -290,8 +306,16 @@ SubFileOutcome run_sub_file(obn::tunnel_local::Session* session,
         const int rs  = obn::tunnel_local::parse_wire_sequence(wire_json);
         if (cmd == obn::tunnel_local::kCmdSubFile &&
             static_cast<std::uint32_t>(rs) == seq) {
+            // When reply.path names a requested path, keep the image for the
+            // earliest one (tile_thumbnail_sub_paths() lists them best
+            // first), whatever order the frames arrive in.
             if (!chunk.empty() && wire_chunk_is_image(chunk)) {
-                out.data = chunk;
+                const std::size_t rank =
+                    sub_file_reply_rank(wire_json, req.paths);
+                if (out.data.empty() || rank < best_rank) {
+                    out.data  = chunk;
+                    best_rank = rank;
+                }
             }
             const int result = obn::tunnel_local::parse_wire_result(wire_json);
             out.wire_result = result;
@@ -722,6 +746,16 @@ std::vector<std::string> sub_file_storage_labels(const std::string& list_storage
     return {list_storage};
 }
 
+// Collects per-storage failures as "'<storage>': <error>; ..." so the final
+// cover-fetch error names the wire result instead of a generic message.
+void append_storage_failure(std::string*       out,
+                            const std::string& storage,
+                            const std::string& error)
+{
+    if (!out->empty()) out->append("; ");
+    out->append("'" + storage + "': " + error);
+}
+
 std::vector<std::string> tile_thumbnail_sub_paths(const std::string& path,
                                                   int                plate_idx)
 {
@@ -921,6 +955,11 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
     }
     if (plate_idx < 1) plate_idx = 1;
 
+    // A printer can refuse every listing, e.g. result 17 STORAGE_UNAVAILABLE
+    // (research/09.05-ctrl.md §9.5.3); that must not read as a missing model.
+    std::string list_failures;
+    bool        any_list_ok = false;
+
     for (const auto& list_storage : model_list_storages()) {
         std::uint32_t seq = 0;
         SSL* ssl = nullptr;
@@ -934,11 +973,16 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
 
         const ListInfoOutcome list =
             run_list_info(session, ssl, &impl_->io_mu, seq, list_storage);
-        if (!list.ok) continue;
+        if (!list.ok) {
+            append_storage_failure(&list_failures, list_storage, list.error);
+            continue;
+        }
+        any_list_ok = true;
 
         const ModelFileEntry* hit = find_model_entry(list, model_name);
         if (!hit) continue;
 
+        std::string sub_failures;
         for (const auto& wire_storage : sub_file_storage_labels(list_storage)) {
             {
                 std::lock_guard<std::mutex> lk(impl_->io_mu);
@@ -953,6 +997,7 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             const SubFileOutcome sf =
                 run_sub_file(session, ssl, &impl_->io_mu, seq, req);
             if (!sf.ok || sf.data.empty() || !wire_chunk_is_image(sf.data)) {
+                append_storage_failure(&sub_failures, wire_storage, sf.error);
                 continue;
             }
             out.ok   = true;
@@ -960,11 +1005,17 @@ ModelThumbnailOutcome Connection::fetch_model_tile_thumbnail(
             out.data = sf.data;
             return out;
         }
-        out.error = "SUB_FILE thumbnail failed";
+        out.error = "SUB_FILE thumbnail failed (" + sub_failures + ")";
         return out;
     }
 
-    out.error = "model not in LIST_INFO";
+    if (!any_list_ok && !list_failures.empty()) {
+        out.error = "LIST_INFO failed (" + list_failures + ")";
+    } else if (!list_failures.empty()) {
+        out.error = "model not in LIST_INFO (failed: " + list_failures + ")";
+    } else {
+        out.error = "model not in LIST_INFO";
+    }
     return out;
 }
 

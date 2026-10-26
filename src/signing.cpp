@@ -629,6 +629,8 @@ bool slicer_app_cert_usable()
     // key). Defaults under config_dir count when obn.conf paths are empty.
     // Soft date/revocation issues still return true (firmware accepts expired
     // official CRLs); WARN once — Studio calls install_device_cert ~1 Hz.
+    // The cert id is logged once on the first successful check for the same
+    // reason.
     static bool warned_cert_dates = false;
     static bool warned_crl_dates = false;
     static bool warned_revoked = false;
@@ -704,7 +706,7 @@ bool slicer_app_cert_usable()
 
     if (!logged_cert_id) {
         logged_cert_id = true;
-        const std::string id = slicer_cert_id();
+        const std::string& id = slicer_cert_id();
         if (id.empty())
             OBN_WARN("signing: slicer app certificate loaded but cert_id is empty");
         else
