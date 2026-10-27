@@ -78,7 +78,8 @@ from wire observation only — the SDK itself was never decompiled.
 
 - baltobu repos: MIT fresh-prose docs are safe spec-layer input; raw
   decompile output never read, never vendored.
-- AGPL repos (beambam, bambuddy, bami): facts only, never copy code.
+- AGPL repos (beambam, bambuddy, bami, BB-Open): facts only, never copy
+  code.
 - Unlicensed repos: facts only.
 - The vendor binary itself: never redistributed (SHA-256 only).
 

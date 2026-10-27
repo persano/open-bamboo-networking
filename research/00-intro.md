@@ -4,6 +4,8 @@ This document describes how Bambu Studio integrates with its proprietary **Netwo
 
 The reference is derived from three independent sources, none of them involving binary disassembly:
 
+0. *Fact-level exception:* a few protocol **facts** (never code) reached these pages through others' published binary analysis — a rodata-recovered key-name superset in [§8.6](08.06-bind.md), the `ft_job_result` layout confirmed by an upstream disassembly report (issue #49), and spec-layer facts tagged #10–#18 from the baltobu MIT static-analysis docs (cross-checked in the workspace `BALTOBU_CROSSCHECK.md`). Facts are not copyrightable; no disassembly output was read directly and no binary-derived code exists in the tree (see `CLEANROOM.md`).
+
 1. A read-through of the upstream [bambulab/BambuStudio](https://github.com/bambulab/BambuStudio) (and the closely related [SoftFever/OrcaSlicer](https://github.com/SoftFever/OrcaSlicer)) trees — every Studio-side claim in this document is backed by a concrete file and line range in those sources.
 2. **MITM captures** of the stock `libbambu_networking.so` against `api.bambulab.com`, MakerWorld and the printer's LAN MQTT / FTPS / RTSPS endpoints, used to reverse the wire format the closed-source `bambu_networking` binary actually produces (HTTPS bodies, MQTT JSON envelopes, FTPS dialect quirks, etc.).
 3. **Cross-ABI matrix runs** against the stock plugin in versions `02.05.00` … `02.06.01` to track how a given `BBL::PrintParams` value is rendered onto the LAN MQTT `print:project_file` payload, and how that mapping shifts as fields are added to `PrintParams` over time.
