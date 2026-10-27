@@ -35,15 +35,21 @@ own clean-room rule, also ours.
    **Default remains ON** — releases ship as today — so the blocker is
    narrowed: a clean-room claim must name the `OBN_EMBED_SECRET=OFF`
    build configuration.
-2. **Binary-analysis-derived knowledge in shipped source — inventoried
-   2026-10-27, see the table below.** Sole instance in `src/`: the app-cert
-   pair (`src/appcert_cipher.cpp`, `src/appcert_fetch.cpp`,
-   `include/obn/appcert.hpp`) — secret recovered from a memory dump, cipher
-   understanding ran through dump analysis + the community work it was
-   ported from (ClusterM PR #67 discussion + BambuSlicerKeySaver commit
-   `ac097b62`), validated against public KATs. The `server_wrap_key` is a
-   public certificate (fact-level material, reverse-networking
-   `service.crt`). No other shipped file shows binary-analysis markers.
+2. **RESOLVED 2026-10-27 — app-cert cipher provenance.** The shipped
+   expression is ours end to end: `tools/fetch_slicer_credentials.py`
+   (fresh python reference) → C++ port in `src/appcert_cipher.cpp`
+   (library TU with CRT→PEM rebuild + KAT harness — structurally unlike
+   the upstream's CLI decrypt tool). Inputs are published **facts**, never
+   copied code: algorithm description, custom S-box permutation, blob
+   framing, KAT vectors from BambuSlicerKeySaver commit `ac097b62`
+   (AGPL-3.0 — read for facts under the input rules) and ClusterM PR #67
+   prose. The S-box's ultimate origin is that community's binary
+   extraction — consumed here as a published fact, same category as the
+   rodata fact in the provenance caveats. The memory dump contributed
+   only the embedded secret (blocker 1, now build-optional) — not the
+   algorithm. Residue: "no copied lines" rests on cross-language +
+   structural comparison, not a line-by-line audit of the python
+   reference against the AGPL source.
 
 ## Provenance of every shipped file under `src/` (2026-10-27)
 
@@ -58,7 +64,7 @@ above).
 
 | Class | Files | Evidence |
 |-------|-------|----------|
-| **Binary-analysis-derived** | `appcert_cipher.cpp`, `appcert_fetch.cpp` (+ their `include/obn/appcert.hpp`) | `PROVENANCE` block: secret from `tools/extract_key_from_dump.py` memory dump; cipher "ported 1:1" from community PR #67 / BambuSlicerKeySaver lineage; KATs from `tools/fetch_slicer_credentials.py --self-test` |
+| **Community facts + self-authored expression** (secret was dump-derived, now `OBN_EMBED_SECRET`-optional) | `appcert_cipher.cpp`, `appcert_fetch.cpp` (+ their `include/obn/appcert.hpp`) | `PROVENANCE` block: algorithm + KATs from published material (BambuSlicerKeySaver `ac097b62` AGPL facts, PR #67 prose, public vectors), expression fresh (python reference → this C++ port); secret from `tools/extract_key_from_dump.py` — the dump-derived part, excluded by `-DOBN_EMBED_SECRET=OFF`; see blocker 2 (resolved) |
 | **Vendor data (facts, no code)** | `err_table.cpp`, `err_table_data.cpp` (auto-generated) | ATILLLLITA/OpenBambuFarmAPI `farm-errors.md` (GNU FDL) + PandaSpy HMS `en.json` asset, both attributed in-file |
 | **Wire (MITM) primary** | `camera/ICameraSource.hpp`, `camera/TutkCameraSource.cpp`, `camera/TutkCameraSource.hpp`, `camera/tutk/Fec.cpp`, `camera/tutk/Fec.hpp`, `camera/tutk/IotcClient.cpp`, `camera/tutk/IotcProtocol.hpp`, `camera/tutk/TutkSession.cpp`, `camera/tutk/TutkSession.hpp`, `camera_probe.cpp`, `camera_url.cpp`, `abi_http.cpp`, `abi_makerworld.cpp`, `abi_user.cpp`, `cloud_auth.cpp`, `cloud_print.cpp`, `cloud_filament.cpp`, `cloud_presets.cpp`, `ftps.cpp`, `ftps_parse.hpp`, `mqtt_client.cpp`, `bind_cloud.cpp`, `lan_bind_tcp.cpp`, `lan_session.cpp`, `ssdp.cpp`, `tunnel_local.cpp`, `tunnel_upload.cpp`, `tls_dial.cpp`, `cover_cache.cpp`, `cover_server.cpp` | `WIRE`/`RESEARCH` markers; TUTK client explicitly "as observed on the wire" (clean-room P2P, `SOLUTIONS_AND_FINDINGS.md` §3); `bind_cloud` "Stock: POST/GET…" comments |
 | **Studio source primary** | `abi_bind.cpp`, `abi_callbacks.cpp`, `abi_camera.cpp`, `abi_cloud.cpp`, `abi_filament.cpp`, `abi_ft.cpp`, `abi_lan.cpp`, `abi_lifecycle.cpp`, `abi_meta.cpp`, `abi_presets.cpp`, `abi_print.cpp`, `abi_track.cpp`, `print_job.cpp`, `signing.cpp`, `config.cpp`, `lan_tls.cpp`, `cert_store.cpp`, `auth.cpp`, `state.cpp`, `print_job_naming.cpp`, `print_params_ftp_prefs.cpp` | `STUDIO` markers / in-file Studio citations (`abi_ft`: `slic3r/Utils/FileTransferUtils.hpp`; `print_job`: `PrintJob::process` lan branch); ABI contract = Studio C ABI |
@@ -98,5 +104,7 @@ from wire observation only — the SDK itself was never decompiled.
 2. ~~File-by-file provenance pass over `src/`~~ — **done 2026-10-27**, table
    above; all 68 tracked files classified, sole binary-analysis instance =
    the app-cert pair.
-3. Only after 1 + 2: use "clean-room" wording in `README.md` and the
-   workspace `PROJECT_OVERVIEW.md` (both currently use it loosely).
+3. ~~Use "clean-room" wording in `README.md` and the workspace
+   `PROJECT_OVERVIEW.md`~~ — **done 2026-10-27**: both name the claim
+   scoped to `-DOBN_EMBED_SECRET=OFF` with a pointer here. The plugin
+   install screen carries the matching import hint.
