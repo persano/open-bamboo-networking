@@ -19,7 +19,8 @@ namespace obn::appcert {
 
 // The 43-byte client_auth_secret (app-cert CN prefix + fixed ASCII tail).
 // Never logged or added to headers — only ever AES-GCM-encrypted into the
-// request URL path segment.
+// request URL path segment. OBN_CLIENT_AUTH_SECRET (43 bytes) overrides the
+// embedded default at runtime (rotation / no-embedded builds).
 std::string client_auth_secret();
 
 // PEM SubjectPublicKeyInfo of CN=service.bambulab.com — the public "server

@@ -48,6 +48,12 @@
 // path needs a manual refresh whenever Bambu rotates the certificate; the
 // fetch implemented here does not.
 //
+// OVERRIDE: setting OBN_CLIENT_AUTH_SECRET (43 ASCII bytes) replaces the
+// embedded default at runtime — rotation without a rebuild, or a hard opt-out
+// from shipping the vendor value at all (strip kClientAuthSecret and require
+// the env var or the ALTERNATIVE disk path above). The disk fallback for the
+// cert material itself already exists in cert_store.cpp (ClusterM PR #95).
+//
 // The cipher itself is Bambu's published appcert_cipher (custom S-box AES-
 // 256-CTR over fixed key 00..1f, counter from 2) — ported 1:1 from
 // tools/fetch_slicer_credentials.py, which is itself validated against
@@ -72,6 +78,7 @@
 #include <openssl/rsa.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -289,7 +296,16 @@ struct CtxDel { void operator()(BN_CTX* p) const { BN_CTX_free(p); } };
 
 } // namespace
 
-std::string client_auth_secret() { return kClientAuthSecret; }
+std::string client_auth_secret()
+{
+    // Runtime override for rotation without a rebuild, and for builds that
+    // ship without the embedded default (see the ALTERNATIVE note above).
+    // A wrong-length value is passed through as-is; the endpoint rejects it
+    // with HTTP 4xx.
+    if (const char* v = std::getenv("OBN_CLIENT_AUTH_SECRET"); v && *v)
+        return v;
+    return kClientAuthSecret;
+}
 
 const char* server_wrap_key_pem() { return kServerWrapKeyPem; }
 

@@ -184,6 +184,27 @@ int test_bootstrap_values()
     return 0;
 }
 
+int test_secret_env_override()
+{
+    const std::string def = obn::appcert::client_auth_secret();
+
+    const char fake[] = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+#if defined(_WIN32)
+    _putenv_s("OBN_CLIENT_AUTH_SECRET", fake);
+#else
+    setenv("OBN_CLIENT_AUTH_SECRET", fake, 1);
+#endif
+    CHECK(obn::appcert::client_auth_secret() == fake);
+
+#if defined(_WIN32)
+    _putenv_s("OBN_CLIENT_AUTH_SECRET", "");
+#else
+    unsetenv("OBN_CLIENT_AUTH_SECRET");
+#endif
+    CHECK(obn::appcert::client_auth_secret() == def);
+    return 0;
+}
+
 int test_decode_rejects_garbage()
 {
     std::array<std::string, 5> limbs;
@@ -338,6 +359,7 @@ int main()
     if (test_ctr_roundtrip()       != 0) rc = 1;
     if (test_b64url()              != 0) rc = 1;
     if (test_bootstrap_values()    != 0) rc = 1;
+    if (test_secret_env_override() != 0) rc = 1;
     if (test_decode_rejects_garbage() != 0) rc = 1;
     if (test_crt_blob_roundtrip()  != 0) rc = 1;
     if (rc == 0) std::cout << "appcert_test: ok\n";
