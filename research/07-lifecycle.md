@@ -35,3 +35,15 @@ When a printer is in the new-auth / secured world (Developer Mode off), privileg
 ### Direct LAN MQTT and steady idle
 
 Open Studio calls `connect_printer` only when selecting a **LAN-mode** printer ([§8.4.3](08.04-lan.md)). For a **cloud-paired** device the stock plugin still opens a LAN MQTT session (`bblp` / access code, typically TLS :8883) when IP + code are known — that dual-session path is not a second Studio `connect_printer` call site ([§8.4.1](08.04-lan.md), [§6.2](06.02-mqtt.md)). On a healthy LAN, Studio prefers that local session for `device/<id>/report` and leaves the cloud report topic unsubscribed while local telemetry flows — both sockets can be up at once. Steady idle is this ongoing overlap: SSDP refreshing IPs, REST occasionally refreshing codes and bind info, cloud MQTT kept warm, LAN MQTT carrying `push_status`, and re-installing app certs when a secured printer forgets them after reboot. Connection ABI: [§8.4](08.04-lan.md).
+
+### Connection state machines (static)
+
+LAN-vs-cloud arbiter (`DeviceSubscribeManager`) states: `NO_CHANNELS`, `LOCAL_TRYING`, `LOCAL_ONLY_TRY_CLOUD`, `NO_LOCAL`, `BOTH_PREFER_LOCAL`, `BOTH_PREFER_CLOUD`, `CLOUD_ONLY`. MQTT connection machine (`MqttConnectionManager`): `Initial` / `Connecting` / `Connected` / `Reconnecting` / `Destroyed`, with log literals `OnConnected!`, `won't retry any more`, and `MqttConnectionManager destroy! alive channels count = {}`.
+
+> Source: INTERESTING_REPOS.md cross-check #16 (baltobu docs/07, Frix-x/baltobu-reverse-networking, MIT)
+
+### Channel RTTI hierarchy (static)
+
+Recovered from RTTI in the binary: `ISubscribeChannel` ← `MqttSubscribeChannel` ← `MqttCloudSubscribeChannel` / `MqttLocalSubscribeChannel`; alongside them `MqttChannelListener`, `MqttConnectionManager`, `JsonOrJsonBinFramer`, `SimpleFramer`.
+
+> Source: INTERESTING_REPOS.md cross-check #16 (baltobu docs/06, Frix-x/baltobu-reverse-networking, MIT)
