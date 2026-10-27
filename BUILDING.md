@@ -97,6 +97,11 @@ to your `./configure --enable-tests ...` call (`0` sets no per-test limit;
 | `--build-dir=DIR`         | `build`                                                        | Where CMake writes its build tree. Only relevant if you want to keep several builds side by side.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `--cmake-arg=ARG`         | none                                                           | Pass an arbitrary flag through to CMake (e.g. `--cmake-arg=-GNinja`). Repeatable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
+**Clean-room build:** `./configure --cmake-arg=-DOBN_EMBED_SECRET=OFF`
+strips the embedded vendor `client_auth_secret` from the binary; supply it
+via `OBN_CLIENT_AUTH_SECRET` or `<config_dir>/client_auth_secret.txt`
+instead (details and provenance: `CLEANROOM.md`). Default stays `ON`.
+
 **Version auto-detection** (omit `--with-version`):
 
 - **Bambu Studio** — baseline comes from the slicer’s own build id: the `"version"` field inside the `"app"` object of `<prefix>/BambuStudio.conf` (written after you launch Studio at least once). That is the tag Studio and its bundled agent advertise; the plugin must match the **first eight characters** (`MAJOR.MINOR.PATCH`).

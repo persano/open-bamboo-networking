@@ -587,6 +587,7 @@ wins when both are set):
 | `OBN_LOG_STDERR`  | `1`       | When `1`, copy every line to stderr with an `[obn]` prefix. Set to `0` to suppress the console copy (only useful together with a file sink). |
 | `OBN_LOG_TO_FILE` | *(unset)* | Set to `1`/`true`/`yes` to append to `<data_dir>/obn.log` after Studio passes `data_dir`. Ignored if `OBN_LOG_FILE` is set.                  |
 | `OBN_LOG_FILE`    | *(unset)* | Absolute path to a log file. Creates the file sink when non-empty.                                                                           |
+| `OBN_CLIENT_AUTH_SECRET` | *(unset)* | 43 ASCII bytes: the `client_auth_secret` for the app-cert fetch, replacing the embedded value (env only — not an `obn.conf` key). Clean-room builds (`-DOBN_EMBED_SECRET=OFF`) may instead drop `client_auth_secret.txt` with those 43 bytes into `<data_dir>`; see `CLEANROOM.md`. |
 
 Example — default behaviour (info to terminal only):
 
