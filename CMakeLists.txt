@@ -153,6 +153,14 @@ endif()
 
 option(OBN_RELEASE "Build a release (show project version instead of commit hash)" OFF)
 
+# Clean-room knob: OFF strips the vendor client_auth_secret from the binary.
+# The secret then comes from OBN_CLIENT_AUTH_SECRET or
+# <config_dir>/client_auth_secret.txt (see src/appcert_fetch.cpp).
+option(OBN_EMBED_SECRET "Embed the vendor client_auth_secret (OFF = clean-room build)" ON)
+if(OBN_EMBED_SECRET)
+    add_compile_definitions(OBN_EMBED_SECRET=1)
+endif()
+
 # Extract OBN_PROJECT_VERSION from the single source of truth: include/obn/version.hpp
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/include/obn/version.hpp" _obn_ver_hpp)
 string(REGEX MATCH "OBN_PROJECT_VERSION \"([^\"]+)\"" _obn_ver_match "${_obn_ver_hpp}")

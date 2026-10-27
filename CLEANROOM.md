@@ -25,11 +25,16 @@ own clean-room rule, also ours.
 
 1. **Embedded vendor secret.** `kClientAuthSecret` in
    `src/appcert_cipher.cpp` was extracted from a live stock Bambu Studio
-   memory dump (`tools/extract_key_from_dump.py`). Mitigation shipped
-   2026-10-27: `OBN_CLIENT_AUTH_SECRET` (43 ASCII bytes) overrides it at
-   runtime, and the no-embedded build path is strip-constant + env var or
-   the manual `slicer_cert.pem` disk fallback (`cert_store.cpp`, ClusterM
-   PR #95). The default build still embeds the value.
+   memory dump (`tools/extract_key_from_dump.py`). Resolution shipped
+   2026-10-27: `-DOBN_EMBED_SECRET=OFF` compiles the constant out
+   entirely (verified: secret absent from the built binary), and such a
+   build sources the secret from `OBN_CLIENT_AUTH_SECRET` (43 ASCII
+   bytes) or `<config_dir>/client_auth_secret.txt` (the import file for
+   the plugin-install flow). The cert-material disk fallback remains
+   `slicer_cert.pem` etc. (`cert_store.cpp`, ClusterM PR #95).
+   **Default remains ON** — releases ship as today — so the blocker is
+   narrowed: a clean-room claim must name the `OBN_EMBED_SECRET=OFF`
+   build configuration.
 2. **Binary-analysis-derived knowledge in shipped source — inventoried
    2026-10-27, see the table below.** Sole instance in `src/`: the app-cert
    pair (`src/appcert_cipher.cpp`, `src/appcert_fetch.cpp`,
@@ -85,9 +90,11 @@ from wire observation only — the SDK itself was never decompiled.
 
 ## Upgrade path to a claim
 
-1. Strip `kClientAuthSecret` from default builds (plumbing ready: env
-   override + disk fallback above) or gate it behind an explicit build
-   flag.
+1. ~~Strip `kClientAuthSecret` from default builds~~ — **done 2026-10-27**
+   as an opt-in: `-DOBN_EMBED_SECRET=OFF` (default `ON` keeps current
+   delivery), env var + `<config_dir>/client_auth_secret.txt` supply the
+   secret in clean builds; both configurations tested (`appcert_test`
+   passes, full ctest 35/35 with the flag on).
 2. ~~File-by-file provenance pass over `src/`~~ — **done 2026-10-27**, table
    above; all 68 tracked files classified, sole binary-analysis instance =
    the app-cert pair.

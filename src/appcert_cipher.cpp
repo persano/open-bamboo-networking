@@ -49,10 +49,12 @@
 // fetch implemented here does not.
 //
 // OVERRIDE: setting OBN_CLIENT_AUTH_SECRET (43 ASCII bytes) replaces the
-// embedded default at runtime — rotation without a rebuild, or a hard opt-out
-// from shipping the vendor value at all (strip kClientAuthSecret and require
-// the env var or the ALTERNATIVE disk path above). The disk fallback for the
-// cert material itself already exists in cert_store.cpp (ClusterM PR #95).
+// embedded default at runtime — rotation without a rebuild. A clean-room
+// build (-DOBN_EMBED_SECRET=OFF) compiles kClientAuthSecret out entirely;
+// such builds take the secret from the env var or from
+// <config_dir>/client_auth_secret.txt (checked in appcert_fetch.cpp). The
+// disk fallback for the cert material itself already exists in
+// cert_store.cpp (ClusterM PR #95).
 //
 // The cipher itself is Bambu's published appcert_cipher (custom S-box AES-
 // 256-CTR over fixed key 00..1f, counter from 2) — ported 1:1 from
@@ -87,6 +89,7 @@ namespace obn::appcert {
 
 namespace {
 
+#ifdef OBN_EMBED_SECRET
 // The 43-byte client_auth_secret: app-cert CN prefix
 // "GLOF3813734089-eed1e0410000" + fixed tail "11037d8d06ea7c59".
 // ASCII; hex would be 474c4f46333831333733343038392d65656431653034313030303031313033376438643036656137633539.
@@ -94,6 +97,7 @@ constexpr char kClientAuthSecret[] =
     "GLOF3813734089-eed1e041000011037d8d06ea7c59";
 static_assert(sizeof(kClientAuthSecret) - 1 == 43,
               "client_auth_secret must stay 43 bytes");
+#endif // OBN_EMBED_SECRET
 
 // Public key of CN=service.bambulab.com (server wrap key, published in the
 // reverse-networking docs' service.crt). Wraps the ephemeral AES-GCM session
@@ -299,12 +303,16 @@ struct CtxDel { void operator()(BN_CTX* p) const { BN_CTX_free(p); } };
 std::string client_auth_secret()
 {
     // Runtime override for rotation without a rebuild, and for builds that
-    // ship without the embedded default (see the ALTERNATIVE note above).
+    // ship without the embedded default (see the OVERRIDE note above).
     // A wrong-length value is passed through as-is; the endpoint rejects it
     // with HTTP 4xx.
     if (const char* v = std::getenv("OBN_CLIENT_AUTH_SECRET"); v && *v)
         return v;
+#ifdef OBN_EMBED_SECRET
     return kClientAuthSecret;
+#else
+    return {};
+#endif
 }
 
 const char* server_wrap_key_pem() { return kServerWrapKeyPem; }

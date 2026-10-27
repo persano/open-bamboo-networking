@@ -37,8 +37,10 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 
@@ -321,9 +323,26 @@ bool fetch_and_store(std::string* err)
     const std::string dir = obn::config::dir();
     if (dir.empty())
         return fail("config dir not set (set_config_dir not called)");
-    const std::string secret = client_auth_secret();
+    // Secret resolution: OBN_CLIENT_AUTH_SECRET env, else an imported
+    // <config_dir>/client_auth_secret.txt (one line, 43 ASCII bytes — the
+    // install UI drop point for clean-room builds), else the embedded
+    // default (compiled out under OBN_EMBED_SECRET=OFF).
+    std::string secret;
+    if (const char* v = std::getenv("OBN_CLIENT_AUTH_SECRET"); v && *v) {
+        secret = v;
+    } else {
+        std::ifstream sf(dir + "/client_auth_secret.txt");
+        if (sf && std::getline(sf, secret) && !secret.empty() &&
+            secret.back() == '\r')
+            secret.pop_back();
+        if (secret.empty())
+            secret = client_auth_secret();
+    }
     if (secret.size() != 43)
-        return fail("embedded client_auth_secret has wrong length");
+        return fail(
+            "client_auth_secret missing or wrong length (set "
+            "OBN_CLIENT_AUTH_SECRET or add <config_dir>/"
+            "client_auth_secret.txt)");
 
     // 1. Session key + wrapped secret.
     unsigned char session_key[32];

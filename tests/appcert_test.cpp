@@ -168,10 +168,12 @@ int test_b64url()
 
 int test_bootstrap_values()
 {
+#ifdef OBN_EMBED_SECRET
     const std::string secret = obn::appcert::client_auth_secret();
     CHECK(secret.size() == 43);
     CHECK(secret.substr(0, 27) == "GLOF3813734089-eed1e0410000");
     CHECK(secret.substr(27) == "11037d8d06ea7c59");
+#endif
 
     const std::string wrap(obn::appcert::server_wrap_key_pem());
     std::unique_ptr<BIO, BioDel> bio(
