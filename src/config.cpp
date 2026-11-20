@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -600,4 +602,52 @@ OBN_ABI int obn_ensure_conf_fixes(const char* conf_path)
 {
     if (!conf_path) return -1;
     return obn::config::ensure_conf_fixes(conf_path);
+}
+
+// Native file reader for the plugin (issue #17): the slicer's plugin audit
+// hard-denies Python open() of OrcaSlicer.conf / slicer_cert.pem, and on
+// flatpak that denial killed the process. C++ fopen runs outside the CPython
+// audit hook, so the plugin routes those reads here.
+//
+// Contract (matches open_bambu_networking.native_read_file):
+//   probe  : out == NULL || out_capacity == 0 -> returns the file size in
+//            bytes (offset ignored).
+//   read   : copies up to out_capacity bytes starting at offset; returns the
+//            number of bytes copied (0 allowed: offset at/past EOF).
+//   errors : -1 invalid argument, -2 file not found, -3 read error.
+// Negative offset would mean "from end"; the plugin normalizes before calling,
+// so this function treats offset as unsigned and clamps at EOF.
+OBN_ABI long long obn_read_text_file(const char* path,
+                                     unsigned long long offset,
+                                     char* out,
+                                     unsigned int out_capacity)
+{
+    if (!path || !*path) return -1;
+
+    FILE* f = std::fopen(path, "rb");
+    if (!f) {
+        return (errno == ENOENT) ? -2 : -3;
+    }
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return -3; }
+    const long long size = static_cast<long long>(std::ftell(f));
+    if (size < 0) { std::fclose(f); return -3; }
+
+    if (out == nullptr || out_capacity == 0) {
+        std::fclose(f);
+        return size;
+    }
+    if (offset >= static_cast<unsigned long long>(size)) {
+        std::fclose(f);
+        return 0;
+    }
+    if (std::fseek(f, static_cast<long>(offset), SEEK_SET) != 0) {
+        std::fclose(f);
+        return -3;
+    }
+    const std::size_t want = static_cast<std::size_t>(out_capacity);
+    const std::size_t got  = std::fread(out, 1, want, f);
+    const bool errored = std::ferror(f) != 0;
+    std::fclose(f);
+    if (errored) return -3;
+    return static_cast<long long>(got);
 }
