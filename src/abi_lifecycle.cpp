@@ -6,6 +6,7 @@
 #include "obn/config.hpp"
 #include "obn/log.hpp"
 #include "obn/openssl_host_check.hpp"
+#include "obn/queue_api.hpp"
 
 using obn::Agent;
 using obn::as_agent;
@@ -52,6 +53,9 @@ OBN_ABI int bambu_network_destroy_agent(void* agent)
 {
     OBN_INFO("destroy_agent %p", agent);
     delete as_agent(agent);
+    // A new agent instance starts a fresh session generation: purge the queue
+    // state the old one produced so snapshots cannot outlive their source.
+    obn::queue::note_session_changed("agent_replaced");
     return BAMBU_NETWORK_SUCCESS;
 }
 

@@ -13,6 +13,7 @@
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
+#include "obn/queue_api.hpp"
 
 using obn::as_agent;
 
@@ -202,6 +203,8 @@ bool fetch_user_print_info(obn::Agent* a,
     // LAN connect_printer ever runs in this session.
     for (const auto& [dev_id, code] : access_codes)
         a->note_device_access_code(dev_id, code);
+
+    obn::queue::note_devices_from_cloud(resp.body);
 
     if (out_mapped) *out_mapped = std::move(mapped);
     return true;

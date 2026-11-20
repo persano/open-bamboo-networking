@@ -416,6 +416,7 @@ add_library(bambu_networking SHARED
     src/openssl_host_check.cpp
     src/plugin_load_banner.cpp
     src/mqtt_client.cpp
+    src/queue_api.cpp
     src/os_compat.cpp
     src/oss_sign.cpp
     src/print_job.cpp
@@ -1050,6 +1051,7 @@ if(OBN_BUILD_TESTS)
         src/print_job_naming.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/queue_api.cpp
         src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
@@ -1084,6 +1086,30 @@ if(OBN_BUILD_TESTS)
         ZLIB::ZLIB
     )
     add_test(NAME agent COMMAND agent_test)
+
+    # Versioned queue integration API (issues #13/#16, stage 1+2): strict
+    # request validation, capability discovery, client/watch lifecycle,
+    # snapshots, event polling and the native file reader for issue #17.
+    add_executable(queue_api_test tests/queue_api_test.cpp
+        ${OBN_TEST_CORE_SOURCES})
+    target_include_directories(queue_api_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(queue_api_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX}
+    )
+    target_link_libraries(queue_api_test PRIVATE
+        obn_mosquitto_iface
+        obn_curl_iface
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+    )
+    add_test(NAME queue_api COMMAND queue_api_test)
+    # Fixtures resolve at runtime via the working directory (D-08, same
+    # convention as push_status_merge).
+    set_tests_properties(queue_api PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
@@ -1221,6 +1247,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/mqtt_client.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
+        src/queue_api.cpp
         src/state.cpp
         src/signing.cpp
         src/ssdp.cpp

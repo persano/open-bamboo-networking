@@ -30,6 +30,7 @@
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
 #include "obn/print_params_ftp_prefs.hpp"
+#include "obn/queue_api.hpp"
 #include "obn/signing.hpp"
 #include "obn/ssdp.hpp"
 #include "obn/lan_tls.hpp"
@@ -560,6 +561,7 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
     // Do not join the deferred thread here: this callback often runs on the
     // MQTT loop, and that thread is what loop_stop() would wait for.
     if (status == BBL::ConnectStatusOk) {
+        obn::queue::note_connected(dev_id);
         std::lock_guard<std::mutex> lk(deferred_dc_mu_);
         if (deferred_dc_active_) {
             deferred_dc_active_ = false;
@@ -604,6 +606,7 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
             app_cert_install_sent_.erase(dev_id);
             app_cert_install_failed_.erase(dev_id);
         }
+        obn::queue::note_disconnected(dev_id);
         lan_report_failback(dev_id);
     }
 }
@@ -2294,6 +2297,7 @@ void Agent::notify_local_message(const std::string& dev_id, const std::string& j
         }
     }
 
+    obn::queue::ingest_frame(dev_id, patched);
     if (cb) cb(dev_id, patched);
 }
 
@@ -3389,6 +3393,7 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
             std::lock_guard<std::mutex> lk(mu_);
             on_msg = on_message_;
         }
+        obn::queue::ingest_frame(dev_id, json);
         if (on_msg) on_msg(std::move(dev_id), std::move(json));
     };
 }
@@ -3520,6 +3525,7 @@ int Agent::disconnect_cloud()
     if (sess) sess->stop();
     // Release cached RSA pubkeys learned during this cloud session.
     for (const auto& d : devs) cert_store::forget_printer(d);
+    for (const auto& d : devs) obn::queue::note_disconnected(d);
     return BAMBU_NETWORK_SUCCESS;
 }
 

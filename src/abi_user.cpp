@@ -13,6 +13,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/minors.hpp"
+#include "obn/queue_api.hpp"
 
 using obn::as_agent;
 
@@ -28,7 +29,14 @@ OBN_ABI int bambu_network_change_user(void* agent, std::string user_info)
         // Logout is bambu_network_user_logout only.
         return BAMBU_NETWORK_SUCCESS;
     }
-    return a->apply_login_info(user_info);
+    const std::string before = a->user_session_snapshot().user_id;
+    const int rc = a->apply_login_info(user_info);
+    // Only a user change is a session change: Studio may re-send the same
+    // login info, and a purge per resend would invalidate clients for nothing.
+    if (rc == BAMBU_NETWORK_SUCCESS &&
+        a->user_session_snapshot().user_id != before)
+        obn::queue::note_session_changed("login");
+    return rc;
 }
 
 OBN_ABI bool bambu_network_is_user_login(void* agent)
@@ -52,6 +60,9 @@ OBN_ABI int bambu_network_user_logout(void* agent, bool request)
     OBN_TRACE("user_logout request=%d", request);
     auto* a = as_agent(agent);
     if (!a) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+    // Studio polls user_logout every ~2 s as a safety net even while logged
+    // out; only an actual session teardown is a session change.
+    const bool was_logged_in = a->user_logged_in();
     if (request) {
         auto s = a->user_session_snapshot();
         if (!s.access_token.empty()) {
@@ -62,6 +73,7 @@ OBN_ABI int bambu_network_user_logout(void* agent, bool request)
         }
     }
     a->clear_session();
+    if (was_logged_in) obn::queue::note_session_changed("logout");
     return BAMBU_NETWORK_SUCCESS;
 }
 
