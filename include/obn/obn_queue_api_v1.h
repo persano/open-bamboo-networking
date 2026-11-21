@@ -30,7 +30,12 @@ extern "C" {
 // Null output pointers are invalid arguments and must not be dereferenced.
 // Never let C++ exceptions cross this boundary. Never call from DllMain.
 // A transport/internal failure is NOT proof that a command was not accepted.
-// Use command.get / retry the identical request_id in the SAME session.
+// Stage-3 DRAFT contract: see docs/queue-api-v1-stage3/README.md.
+// request_id correlates one RPC, NOT a physical action. command.submit carries
+// a separate submission_scope + idempotency_key. Recover with command.get;
+// retry only the identical command under that same scope/key. A new client,
+// session, or process does not grant permission to dispatch that key again.
+// This header adds no exports, changes no ABI, and enables no command kinds.
 // Calls copy input, enqueue commands, and return cached JSON; no network wait.
 // Returned memory belongs to this module. Free it exactly once below, never
 // with the caller's CRT. Keep the module alive through the call and free.

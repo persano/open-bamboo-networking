@@ -1,0 +1,539 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DRAFT stage-3 responses ONLY",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "capabilities_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "enum": [
+            "command.submit",
+            "command.get"
+          ]
+        },
+        "ok": {
+          "const": true
+        },
+        "result": {
+          "$ref": "#/$defs/receipt"
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "instance_id",
+        "session_epoch",
+        "capabilities_revision",
+        "op",
+        "ok",
+        "result"
+      ],
+      "additionalProperties": true,
+      "not": {
+        "required": [
+          "error"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "capabilities_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "const": "job.get"
+        },
+        "ok": {
+          "const": true
+        },
+        "result": {
+          "type": "object",
+          "properties": {
+            "submission_scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "job": {
+              "$ref": "#/$defs/job"
+            }
+          },
+          "required": [
+            "submission_scope",
+            "job"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "instance_id",
+        "session_epoch",
+        "capabilities_revision",
+        "op",
+        "ok",
+        "result"
+      ],
+      "additionalProperties": true,
+      "not": {
+        "required": [
+          "error"
+        ]
+      }
+    },
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "capabilities_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "enum": [
+            "command.submit",
+            "command.get",
+            "job.get"
+          ]
+        },
+        "ok": {
+          "const": false
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 1024
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "instance_id",
+        "session_epoch",
+        "capabilities_revision",
+        "op",
+        "ok",
+        "error"
+      ],
+      "additionalProperties": true,
+      "not": {
+        "required": [
+          "result"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "terminal": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "source": {
+          "enum": [
+            "printer_report",
+            "reconciled",
+            "unknown"
+          ]
+        },
+        "correlation": {
+          "enum": [
+            "matched",
+            "unverified"
+          ]
+        },
+        "connection_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "quiescent": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "state",
+        "error_code",
+        "observed_at",
+        "source",
+        "correlation",
+        "connection_generation",
+        "quiescent"
+      ],
+      "additionalProperties": true
+    },
+    "job": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "device_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "preparing",
+            "printing",
+            "paused",
+            "completed",
+            "failed",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "started_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/terminal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "job_id",
+        "device_id",
+        "state",
+        "started_at",
+        "terminal"
+      ],
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "enum": [
+                  "completed",
+                  "failed",
+                  "cancelled"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "terminal": {
+                "$ref": "#/$defs/terminal"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "terminal": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "completed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "terminal": {
+                "properties": {
+                  "state": {
+                    "const": "completed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "terminal": {
+                "properties": {
+                  "state": {
+                    "const": "failed"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "cancelled"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "terminal": {
+                "properties": {
+                  "state": {
+                    "const": "cancelled"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "properties": {
+        "submission_scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "idempotency_key": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "command_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "device_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "kind": {
+          "enum": [
+            "print",
+            "pause",
+            "resume",
+            "stop",
+            "skip_objects"
+          ]
+        },
+        "job_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "state": {
+          "enum": [
+            "accepted",
+            "working",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "dispatch": {
+          "enum": [
+            "not_sent",
+            "may_have_been_sent",
+            "confirmed"
+          ]
+        },
+        "accepted_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z$"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "retryable": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "code",
+                "retryable"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "submission_scope",
+        "idempotency_key",
+        "command_id",
+        "device_id",
+        "kind",
+        "job_id",
+        "state",
+        "dispatch",
+        "accepted_at",
+        "updated_at",
+        "error"
+      ],
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "succeeded"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dispatch": {
+                "const": "confirmed"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

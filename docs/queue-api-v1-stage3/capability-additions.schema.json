@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DRAFT additive capability fields",
+  "type": "object",
+  "properties": {
+    "command_protocol_revision": {
+      "const": "stage3-draft-1"
+    },
+    "submission": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "idempotency": {
+          "const": "durable_at_most_once_dispatch"
+        },
+        "receipt_retention": {
+          "const": "until_explicit_store_reset"
+        },
+        "max_retained_keys": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_pending_per_device": {
+          "const": 1
+        }
+      },
+      "required": [
+        "scope",
+        "idempotency",
+        "receipt_retention",
+        "max_retained_keys",
+        "max_pending_per_device"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "command_protocol_revision",
+    "submission"
+  ],
+  "additionalProperties": true
+}

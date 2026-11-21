@@ -1,0 +1,54 @@
+[
+  {
+    "cursor": "e101",
+    "session_epoch": "epoch-A",
+    "capabilities_revision": "stage3-draft-1",
+    "kind": "command.result",
+    "data": {
+      "device_id": "printer-A",
+      "receipt": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-001",
+        "state": "succeeded",
+        "dispatch": "confirmed",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "cursor": "e102",
+    "session_epoch": "epoch-A",
+    "capabilities_revision": "stage3-draft-1",
+    "kind": "job.state",
+    "data": {
+      "device_id": "printer-A",
+      "connection_generation": "connection-1",
+      "job": {
+        "job_id": "job-001",
+        "device_id": "printer-A",
+        "state": "completed",
+        "started_at": "2026-11-21T10:01:00Z",
+        "terminal": {
+          "state": "completed",
+          "error_code": 0,
+          "observed_at": "2026-11-21T11:00:00Z",
+          "source": "printer_report",
+          "correlation": "matched",
+          "connection_generation": "connection-1",
+          "quiescent": true
+        },
+        "job_key": "native-task-001",
+        "task_tag": "queue-item-001",
+        "origin": "unknown",
+        "progress_percent": 100
+      },
+      "evidence": "printer_report"
+    }
+  }
+]
