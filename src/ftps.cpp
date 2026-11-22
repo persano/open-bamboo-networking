@@ -86,15 +86,12 @@ bool verify_peer_cn(SSL* ssl, const std::string& expected_cn, std::string& err)
         err = "no peer certificate";
         return false;
     }
-#if defined(OPENSSL_VERSION_PREREQ) && OPENSSL_VERSION_PREREQ(4, 1)
+    // ALWAYS_CHECK_SUBJECT: the printer leaf carries the serial in the CN and
+    // has no SAN, which OpenSSL 4.1 no longer falls back to (#157).
     const int ok = X509_check_host(cert, expected_cn.c_str(),
                                    expected_cn.size(),
-                                   (0 | X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT) & ~X509_CHECK_FLAG_NEVER_CHECK_SUBJECT,
+                                   X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT,
                                    nullptr);
-#else
-    const int ok = X509_check_host(cert, expected_cn.c_str(),
-                                   expected_cn.size(), 0, nullptr);
-#endif
     X509_free(cert);
     if (ok != 1) {
         err = "certificate CN/host mismatch (expected " + expected_cn + ")";

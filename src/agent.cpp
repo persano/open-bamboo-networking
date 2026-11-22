@@ -54,6 +54,15 @@ constexpr auto kMqttKeepReconnectGracePeriod = std::chrono::seconds(3);
 constexpr auto kLanSilenceFailback = std::chrono::seconds(6);
 constexpr auto kLanWatchdogTick    = std::chrono::seconds(2);
 
+// How long a printer that refused security.app_cert_install is left alone.
+// The slicer asks us to install on its refresh timer (Orca every 5s for the
+// selected machine, Studio ~1 Hz), and a printer whose firmware does not
+// implement the command refuses every single one of them, so without a
+// cooldown we re-publish the whole app cert chain + CRL on that cadence
+// forever. Any reconnect clears the cooldown, so this only limits retries
+// within one session.
+constexpr auto kAppCertRetryAfterFailure = std::chrono::minutes(10);
+
 std::string trim_ip_string(std::string s)
 {
     while (!s.empty() &&
@@ -207,6 +216,11 @@ int Agent::connect_printer(std::string dev_id,
                            std::string password,
                            bool        use_ssl)
 {
+    // Before the keep-connection fast path below: the slicers also call this
+    // for a printer we are already connected to, and on Orca that is the call
+    // that has to restore a selection its refresh timer just cleared (#78).
+    adopt_lan_selection(dev_id);
+
     if (obn::config::current().mqtt_keep_connection) {
         cancel_deferred_disconnect();
         std::string reuse_dev_id;
@@ -357,14 +371,15 @@ int Agent::disconnect_printer()
         cert_store::forget_printer(session->dev_id());
         std::lock_guard<std::mutex> lk(mu_);
         app_cert_install_sent_.erase(session->dev_id());
-        app_cert_install_failed_.erase(session->dev_id());
+        app_cert_install_cooldown_.erase(session->dev_id());
     }
     return BAMBU_NETWORK_SUCCESS;
 }
 
 bool Agent::ensure_lan_session(const std::string& dev_id,
                                const std::string& ip_hint,
-                               const std::string& code_hint)
+                               const std::string& code_hint,
+                               bool               only_if_still_selected)
 {
     if (dev_id.empty()) return false;
 
@@ -393,6 +408,21 @@ bool Agent::ensure_lan_session(const std::string& dev_id,
         OBN_DEBUG("ensure_lan_session: dev=%s missing %s -> cannot open LAN MQTT",
                   dev_id.c_str(), ip.empty() ? "ip" : "access_code");
         return false;
+    }
+
+    // Re-checked here rather than only before the thread was spawned: the
+    // checks above and the cert snapshot inside connect_printer take long
+    // enough for a printer switch to land in between.
+    if (only_if_still_selected) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (user_selected_machine_ != dev_id) {
+            OBN_INFO("ensure_lan_session: dev=%s is no longer the selected "
+                     "printer; leaving the LAN session to %s",
+                     dev_id.c_str(),
+                     user_selected_machine_.empty()
+                         ? "nobody" : user_selected_machine_.c_str());
+            return false;
+        }
     }
 
     // connect_printer() tears down any session to a different printer,
@@ -452,7 +482,8 @@ void Agent::autostart_lan_if_selected(const std::string& dev_id)
     // run it off the caller's thread (SSDP dispatch / HTTP / Studio UI).
     try {
         std::thread([this, dev_id, ip, code]() {
-            ensure_lan_session(dev_id, ip, code);
+            ensure_lan_session(dev_id, ip, code,
+                               /*only_if_still_selected=*/true);
             std::lock_guard<std::mutex> lk(mu_);
             lan_autostart_inflight_.erase(dev_id);
         }).detach();
@@ -528,7 +559,7 @@ void Agent::adopt_lan_selection(const std::string& dev_id)
         for (const auto& dev : stale) last_lan_report_.erase(dev);
     }
     if (changed) {
-        OBN_INFO("connect_printer: selected printer is now %s", dev_id.c_str());
+        OBN_INFO("selected printer is now %s (connected to it)", dev_id.c_str());
         // Outside mu_, as in set_user_selected_machine().
         if (store) store->remember_machine(dev_id);
     }
@@ -637,7 +668,7 @@ void Agent::notify_local_connected(int status, const std::string& dev_id, const 
         {
             std::lock_guard<std::mutex> lk(mu_);
             app_cert_install_sent_.erase(dev_id);
-            app_cert_install_failed_.erase(dev_id);
+            app_cert_install_cooldown_.erase(dev_id);
         }
         obn::queue::note_disconnected(dev_id);
         lan_report_failback(dev_id);
@@ -1192,7 +1223,8 @@ void Agent::harvest_security_report(const std::string& dev_id,
             // printer had already declined.
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                app_cert_install_failed_[dev_id] = std::chrono::steady_clock::now();
+                app_cert_install_cooldown_[dev_id] =
+                    std::chrono::steady_clock::now() + kAppCertRetryAfterFailure;
             }
             app_cert_cv_.notify_all();
             return;
@@ -1250,7 +1282,7 @@ void Agent::harvest_security_report(const std::string& dev_id,
         {
             std::lock_guard<std::mutex> lk(mu_);
             certified_devs_.insert(dev_id);
-            app_cert_install_failed_.erase(dev_id);
+            app_cert_install_cooldown_.erase(dev_id);
             if (cert_on_disk && lan_session_ && lan_session_->dev_id() == dev_id)
                 ip = lan_session_->dev_ip();
         }
@@ -1505,6 +1537,13 @@ void Agent::maybe_install_app_cert(const std::string& dev_id)
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id))
             return; // SUCCESS already harvested this session
+        auto it = app_cert_install_cooldown_.find(dev_id);
+        if (it != app_cert_install_cooldown_.end() &&
+            std::chrono::steady_clock::now() < it->second) {
+            // The printer refused the last request. Don't re-publish the app
+            // cert chain + CRL on every refresh tick until the cooldown ends.
+            return;
+        }
     }
 
     if (!obn::signing::slicer_app_cert_usable()) return;
@@ -1752,10 +1791,16 @@ bool Agent::wait_for_app_cert(const std::string&        dev_id,
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (app_cert_install_sent_.count(dev_id)) return true;
-        auto f = app_cert_install_failed_.find(dev_id);
-        if (f != app_cert_install_failed_.end() &&
-            std::chrono::steady_clock::now() - f->second < kRetryAfterFailure)
-            return false;
+        auto f = app_cert_install_cooldown_.find(dev_id);
+        if (f != app_cert_install_cooldown_.end()) {
+            // Still cooling down: sign straight away, as the timeout path
+            // would have after waiting.
+            if (std::chrono::steady_clock::now() < f->second) return false;
+            // Expired. Drop it here rather than date-comparing below, so a
+            // refusal that lands while we publish the retry cannot be mistaken
+            // for the stale one and leave the caller waiting out the timeout.
+            app_cert_install_cooldown_.erase(f);
+        }
     }
     // No shared app cert configured -> nothing to install, so don't stall the
     // publish; maybe_sign will pass the payload through unsigned anyway.
@@ -1769,22 +1814,24 @@ bool Agent::wait_for_app_cert(const std::string&        dev_id,
     // Block until harvest_security_report latches the SUCCESS ack (which
     // notifies app_cert_cv_) or the timeout elapses. cv release of mu_ lets
     // the MQTT report thread take mu_ and insert the ack.
-    // Wake on a SUCCESS ack, or on a failure reported after this wait began.
-    const auto started = std::chrono::steady_clock::now();
+    // Wake on a SUCCESS ack, or on the refusal of the install kicked above -
+    // the cooldown entry was cleared before publishing, so any entry here is
+    // the answer to that request.
     std::unique_lock<std::mutex> lk(mu_);
-    bool refused = false;
     const bool done = app_cert_cv_.wait_for(lk, timeout, [&] {
-        if (app_cert_install_sent_.count(dev_id) != 0) return true;
-        auto f = app_cert_install_failed_.find(dev_id);
-        refused = f != app_cert_install_failed_.end() && f->second >= started;
-        return refused;
+        return app_cert_install_sent_.count(dev_id) != 0 ||
+               app_cert_install_cooldown_.count(dev_id) != 0;
     });
-    const bool ok = done && !refused;
+    const bool refused = done && app_cert_install_sent_.count(dev_id) == 0;
+    const bool ok      = done && !refused;
     if (refused)
         OBN_WARN("send: app_cert_install refused by %s; signing anyway without "
-                 "waiting (next install attempt in %lld min)",
+                 "waiting (no further install attempt for %lld min)",
                  dev_id.c_str(),
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::minutes>(kRetryAfterFailure).count()));
+                 static_cast<long long>(
+                     std::chrono::duration_cast<std::chrono::minutes>(
+                         kAppCertRetryAfterFailure)
+                         .count()));
     else if (!ok)
         OBN_WARN("send: app_cert_install not acknowledged for %s within %lldms; "
                  "signing anyway (printer may reject with 84033545)",
@@ -3388,8 +3435,8 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
         // (GUI_App::init_networking_callbacks -> command_request_push_all),
         // which is what fills the device panel — AMS trays, temperatures,
         // job state. Losing it leaves that panel empty until something else
-        // asks, so read the callback *fresh* here instead of using the
-        // snapshot taken when connect_cloud() ran: Studio may register it
+        // asks, so read the callback *fresh* here rather than capturing it
+        // when connect_cloud() builds this lambda: Studio may register it
         // after connect_server, and a stale null capture would stay null for
         // the whole session. For the same reason the notification latch is
         // separate from the seen-this-session set — a report that arrives
@@ -3432,6 +3479,10 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
         // session starts (e.g. when switching printer agents). Read it for
         // each report, then call it outside mu_ so it can re-enter Agent.
         // Keep direct delivery: the slicer handles message threading itself.
+        // Deliberately a second lock rather than a field of the snapshot
+        // above: without a queue_on_main_ the on_printer_connected hop runs
+        // inline, and a handler registered from inside it must still see
+        // this report.
         BBL::OnMessageFn on_msg;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -3442,22 +3493,30 @@ BBL::OnMessageFn Agent::make_cloud_message_callback()
     };
 }
 
+BBL::GetSubscribeFailureFn Agent::make_cloud_subscribe_failure_callback()
+{
+    return [this](std::string dev_id) {
+        BBL::GetSubscribeFailureFn on_sub_fail;
+        BBL::QueueOnMainFn         q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            on_sub_fail = on_subscribe_failure_;
+            q           = queue_on_main_;
+        }
+        if (!on_sub_fail) return;
+        auto invoke = [on_sub_fail, dev_id]() { on_sub_fail(dev_id); };
+        if (q) q(invoke); else invoke();
+    };
+}
+
 int Agent::connect_cloud()
 {
     auth::Session s;
-    BBL::OnServerConnectedFn on_server;
-    BBL::GetSubscribeFailureFn on_sub_fail;
-    BBL::QueueOnMainFn       queue;
-    BBL::OnPrinterConnectedFn on_printer_connected;
     std::shared_ptr<CloudSession> session;
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (!cloud_session_) cloud_session_ = std::make_shared<CloudSession>();
-        session              = cloud_session_;
-        on_server            = on_server_connected_;
-        on_sub_fail          = on_subscribe_failure_;
-        queue                = queue_on_main_;
-        on_printer_connected = on_printer_connected_;
+        session = cloud_session_;
     }
 
     if (!auth_store_) {
@@ -3503,15 +3562,30 @@ int Agent::connect_cloud()
     // registered. The message callback is intentionally NOT queued:
     // DeviceManager::on_push_message() is thread-aware and has its own
     // fast-path handling.
-    auto on_connected_cb = [this, on_server, queue]
+    //
+    // None of the handlers below is captured by value. The session outlives
+    // any particular set of them: Orca re-registers the whole bundle when the
+    // user switches printer agents, and hands the agent it is leaving an empty
+    // one. A copy taken here would keep calling a handler the slicer has
+    // disconnected, or stay null for the rest of the session when it was taken
+    // before registration (#154). Read them under mu_ at the point of use and
+    // invoke outside it, so a handler may re-enter the Agent.
+    auto on_connected_cb = [this]
         (int status, int reason, std::string /*msg*/)
     {
         OBN_INFO("cloud: server_connected status=%d reason=%d", status, reason);
+        BBL::OnServerConnectedFn on_server;
+        BBL::QueueOnMainFn       q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            on_server = on_server_connected_;
+            q         = queue_on_main_;
+        }
         if (on_server) {
             auto invoke = [on_server, status, reason]() {
                 on_server(status, reason);
             };
-            if (queue) queue(invoke); else invoke();
+            if (q) q(invoke); else invoke();
         }
         // CONNACK re-applies the whole subscription set, so this is where the
         // devices Studio handed us before the connection came up become
@@ -3531,17 +3605,7 @@ int Agent::connect_cloud()
 
     auto on_msg_cb = make_cloud_message_callback();
 
-    auto on_sub_fail_cb = [this, on_sub_fail](std::string dev_id) {
-        if (on_sub_fail) {
-            BBL::QueueOnMainFn q;
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                q = queue_on_main_;
-            }
-            auto invoke = [on_sub_fail, dev_id]() { on_sub_fail(dev_id); };
-            if (q) q(invoke); else invoke();
-        }
-    };
+    auto on_sub_fail_cb = make_cloud_subscribe_failure_callback();
 
     return session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
 }
@@ -3564,6 +3628,13 @@ int Agent::disconnect_cloud()
              it != app_cert_install_sent_.end(); ) {
             if (*it == lan_dev) ++it;
             else                it = app_cert_install_sent_.erase(it);
+        }
+        // Same for the refusal cooldown, so a reconnect retries the install
+        // instead of signing unacknowledged until the cooldown runs out.
+        for (auto it = app_cert_install_cooldown_.begin();
+             it != app_cert_install_cooldown_.end(); ) {
+            if (it->first == lan_dev) ++it;
+            else                      it = app_cert_install_cooldown_.erase(it);
         }
     }
     if (sess) sess->stop();
@@ -3642,7 +3713,7 @@ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
             cloud_notified_devs_.erase(d);
             cloud_kickstarted_devs_.erase(d);
             app_cert_install_sent_.erase(d);
-            app_cert_install_failed_.erase(d);
+            app_cert_install_cooldown_.erase(d);
         }
     }
     if (!sess) return BAMBU_NETWORK_SUCCESS;

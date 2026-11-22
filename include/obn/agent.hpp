@@ -164,9 +164,17 @@ public:
     // when the current session already targets `dev_id` and is connected.
     // Blocks up to ~3s waiting for the MQTT CONNACK so an immediate publish
     // succeeds.
+    //
+    // `only_if_still_selected` is for autostart_lan_if_selected(), whose work
+    // happens on a detached thread: by the time it runs, the user may have
+    // switched printers, and opening this session would take the LAN session
+    // (and, through connect_printer, the selection) back from the printer they
+    // just picked. The print path leaves it false — it has to reach its target
+    // printer whether or not the device list still points at it.
     bool ensure_lan_session(const std::string& dev_id,
                             const std::string& ip_hint   = {},
-                            const std::string& code_hint = {});
+                            const std::string& code_hint = {},
+                            bool               only_if_still_selected = false);
 
     // Studio calls this every ~1 s from its refresh timer, plus once right
     // after on_printer_connected_fn. We only do real work the first time a
@@ -219,7 +227,8 @@ public:
     // Fire-and-forget app_cert_install when slicer_app_cert_usable().
     // Called from install_device_cert (Studio ABI ~1 Hz / after connect).
     // Skips if app_cert_install_sent_ already has a SUCCESS for this
-    // session; does not wait for the reply.
+    // session, or while app_cert_install_cooldown_ holds a refusal; does not
+    // wait for the reply.
     void maybe_install_app_cert(const std::string& dev_id);
 
     // Starts/stops the LAN SSDP listener that feeds on_ssdp_msg_fn. Bambu
@@ -366,9 +375,11 @@ public:
     // connected. Returns BAMBU_NETWORK_* code.
     int  connect_cloud();
 #ifdef OBN_TESTING
-    // Exercise the real session callback without credentials or a broker.
+    // Exercise the real session callbacks without credentials or a broker.
     BBL::OnMessageFn test_cloud_message_callback()
         { return make_cloud_message_callback(); }
+    BBL::GetSubscribeFailureFn test_cloud_subscribe_failure_callback()
+        { return make_cloud_subscribe_failure_callback(); }
 #endif
     int  disconnect_cloud();
     bool cloud_connected() const;
@@ -478,7 +489,8 @@ public:
     std::string cloud_user_id() const;
 
 private:
-    BBL::OnMessageFn make_cloud_message_callback();
+    BBL::OnMessageFn           make_cloud_message_callback();
+    BBL::GetSubscribeFailureFn make_cloud_subscribe_failure_callback();
 
     // Scans an incoming MQTT report frame (LAN or cloud) for a
     // security.app_cert_install success response and installs the returned
@@ -706,12 +718,16 @@ private:
     // printer acknowledged security.app_cert_install). wait_for_app_cert()
     // waits on this instead of polling. Waits on mu_.
     std::condition_variable app_cert_cv_;
-    // Devices whose last app_cert_install was answered with a failure
-    // (result != SUCCESS or no printer_cert), and when. While a failure is
-    // recent, wait_for_app_cert() returns at once instead of blocking every
-    // signed publish for the full timeout on an install the printer already
-    // refused. Cleared by a later SUCCESS. Guarded by mu_; notifies app_cert_cv_.
-    std::map<std::string, std::chrono::steady_clock::time_point> app_cert_install_failed_;
+    // Negative cache for app_cert_install: dev_id -> time when we may ask
+    // again. Entered when the printer answers the install with a failure
+    // (result != SUCCESS or no printer_cert). While it stands,
+    // wait_for_app_cert() returns at once instead of blocking every signed
+    // publish for the full timeout on an install the printer already refused,
+    // and maybe_install_app_cert() stops re-publishing the request on the
+    // slicer's refresh tick. Cleared by a later SUCCESS and on reconnect.
+    // Guarded by mu_; notifies app_cert_cv_.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        app_cert_install_cooldown_;
     // dev_ids for which a cert-snapshot worker is currently running. Prevents
     // stacking multiple blocking SSL_connect attempts on a printer that
     // refuses the extra handshake.
@@ -782,11 +798,13 @@ private:
     // Re-subscribes the cloud report topic for dev_id (failback) and clears its
     // LAN-priority state. Safe to call when not deferred (no-op-ish).
     void lan_report_failback(const std::string& dev_id);
-    // Called by connect_printer(): Studio connecting a printer is the switch.
-    // Studio only calls set_user_selected_machine() at startup, so without
-    // this the old printer stays "selected" and in lan_report_priority_; the
-    // watchdog then sees it silent and autostart_lan_if_selected() reconnects
-    // it, replacing the single LanSession of the printer just connected.
+    // Called by connect_printer(): connecting a printer *is* the LAN switch.
+    // set_user_selected_machine() is the cloud-mode counterpart (research
+    // §8.7); picking a LAN-mode printer reaches us only as connect_printer
+    // (§8.4). Without this the old printer stays "selected" and in
+    // lan_report_priority_, so the watchdog and every SSDP announcement of it
+    // call autostart_lan_if_selected() and reconnect it, replacing the single
+    // LanSession of the printer just connected.
     // Makes dev_id the selected machine and fails every other device out of
     // LAN priority (only one LAN session exists, so they cannot report).
     void adopt_lan_selection(const std::string& dev_id);

@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -495,6 +496,51 @@ static void test_replayed_config_dir_keeps_store()
     std::filesystem::remove_all(dir, ec);
 }
 
+static void test_connect_printer_switch_moves_selection()
+{
+    // Picking a LAN printer reaches us as a bare connect_printer(); only
+    // cloud-mode selection goes through set_user_selected_machine (research
+    // §8.4/§8.7). The printer we connect to has to become the selected one,
+    // or the watchdog and the SSDP hooks keep reconnecting the old one.
+    const std::filesystem::path dir = fresh_config_dir("connect_switch");
+    {
+        obn::Agent a(".");
+        a.set_config_dir(dir.string());
+        a.set_user_selected_machine("00M00A000000001");
+        // Nothing listens here; the MQTT connect fails in the background.
+        a.connect_printer("00M00A000000002", "127.0.0.1", "bblp", "00000000", true);
+        CHECK(a.user_selected_machine() == "00M00A000000002");
+        a.disconnect_printer();
+    }
+    {
+        obn::Agent restarted(".");
+        restarted.set_config_dir(dir.string());
+        CHECK(restarted.user_selected_machine() == "00M00A000000002");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+static void test_autostart_skips_a_printer_switched_away_from()
+{
+    // An autostart queued for the old printer must not open (and adopt) its
+    // session after the user has moved on: that is the switch bug coming back
+    // through the detached thread that was already running.
+    const std::filesystem::path dir = fresh_config_dir("autostart_switch");
+    obn::Agent a(".");
+    a.set_config_dir(dir.string());
+    a.set_user_selected_machine("00M00A000000002");
+    CHECK(!a.ensure_lan_session("00M00A000000001", "127.0.0.1", "00000000",
+                                /*only_if_still_selected=*/true));
+    CHECK(a.user_selected_machine() == "00M00A000000002");
+    // The print path keeps reaching its target printer either way.
+    a.ensure_lan_session("00M00A000000001", "127.0.0.1", "00000000");
+    CHECK(a.user_selected_machine() == "00M00A000000001");
+    a.disconnect_printer();
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
 // ---------------------------------------------------------------------------
 // Cloud message callback registration
 // ---------------------------------------------------------------------------
@@ -557,34 +603,42 @@ static void test_cloud_message_callback_replaced_and_cleared()
     a.set_on_message_fn(nullptr);
 }
 
+static void test_cloud_subscribe_failure_callback_follows_registration()
+{
+    obn::Agent a(".");
+    // Same registration race as the message handler: the cloud session is
+    // started once and keeps this callback for its whole life.
+    auto report = a.test_cloud_subscribe_failure_callback();
+    report("CLOUD003"); // No handler yet.
+
+    int calls = 0;
+    std::string seen;
+    a.set_on_subscribe_failure_fn([&](std::string dev_id) {
+        ++calls;
+        seen = dev_id;
+    });
+    report("CLOUD003");
+    CHECK(calls == 1);
+    CHECK(seen == "CLOUD003");
+
+    // Unlike report frames, this notification goes through queue_on_main
+    // when the slicer has registered one.
+    int queued = 0;
+    a.set_queue_on_main_fn([&](std::function<void()> fn) { ++queued; fn(); });
+    report("CLOUD003");
+    CHECK(calls == 2);
+    CHECK(queued == 1);
+
+    a.set_on_subscribe_failure_fn(nullptr);
+    report("CLOUD003");
+    CHECK(calls == 2);
+    CHECK(queued == 1); // Nothing to deliver, nothing queued.
+    a.set_queue_on_main_fn(nullptr);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-
-static void test_connect_printer_switch_moves_selection()
-{
-    // Studio calls set_user_selected_machine() only at startup; switching
-    // printers in the device list arrives here as a bare connect_printer().
-    // The printer it connects to has to become the selected one, or the
-    // LAN watchdog keeps failing back to (and reconnecting) the old one.
-    const std::filesystem::path dir = fresh_config_dir("connect_switch");
-    {
-        obn::Agent a(".");
-        a.set_config_dir(dir.string());
-        a.set_user_selected_machine("00M00A000000001");
-        // Nothing listens here; the MQTT connect fails in the background.
-        a.connect_printer("00M00A000000002", "127.0.0.1", "bblp", "00000000", true);
-        CHECK(a.user_selected_machine() == "00M00A000000002");
-        a.disconnect_printer();
-    }
-    {
-        obn::Agent restarted(".");
-        restarted.set_config_dir(dir.string());
-        CHECK(restarted.user_selected_machine() == "00M00A000000002");
-    }
-    std::error_code ec;
-    std::filesystem::remove_all(dir, ec);
-}
 
 int main()
 {
@@ -618,10 +672,12 @@ int main()
     test_selection_before_config_dir_is_persisted();
     test_replayed_config_dir_keeps_store();
     test_connect_printer_switch_moves_selection();
+    test_autostart_skips_a_printer_switched_away_from();
 
     // Cloud message handlers can change during a long-lived session.
     test_cloud_message_callback_registered_after_connect();
     test_cloud_message_callback_replaced_and_cleared();
+    test_cloud_subscribe_failure_callback_follows_registration();
 
     if (fail_count) {
         std::fprintf(stderr, "%d test(s) failed\n", fail_count);

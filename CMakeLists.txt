@@ -1270,6 +1270,18 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
     )
     add_test(NAME lan_live COMMAND lan_live_test)
 
+    add_executable(lan_tls_verify_test tests/lan_tls_verify_test.cpp
+        tests/config_stub.cpp
+        src/lan_tls.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(lan_tls_verify_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(lan_tls_verify_test PRIVATE
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    target_link_libraries(lan_tls_verify_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    add_test(NAME lan_tls_verify COMMAND lan_tls_verify_test)
+
     add_executable(cert_store_test tests/cert_store_test.cpp
         tests/config_stub.cpp
         src/cert_store.cpp
@@ -1335,6 +1347,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         ZLIB::ZLIB
     )
     add_test(NAME cloud_print COMMAND cloud_print_test)
+
 
     add_executable(hms_filter_test tests/hms_filter_test.cpp
         ${OBN_TEST_CORE_SOURCES})
