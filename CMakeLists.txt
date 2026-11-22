@@ -417,6 +417,7 @@ add_library(bambu_networking SHARED
     src/plugin_load_banner.cpp
     src/mqtt_client.cpp
     src/queue_api.cpp
+    src/receipt_store.cpp
     src/os_compat.cpp
     src/oss_sign.cpp
     src/print_job.cpp
@@ -1110,6 +1111,26 @@ if(OBN_BUILD_TESTS)
     # convention as push_status_merge).
     set_tests_properties(queue_api PROPERTIES
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+
+    # Stage-3 durable receipt store (docs/queue-api-v1-stage3/): per-account
+    # append-only JSONL log, cross-process reservation atomicity, torn-line
+    # recovery, fail-closed corruption handling, capacity, compaction.
+    add_executable(receipt_store_test tests/receipt_store_test.cpp
+        tests/config_stub.cpp
+        src/receipt_store.cpp
+        src/json_lite.cpp
+        src/log.cpp
+        src/os_compat.cpp)
+    target_include_directories(receipt_store_test PRIVATE include ${OBN_GENERATED_DIR})
+    target_compile_definitions(receipt_store_test PRIVATE
+        OBN_TESTING
+        OBN_VERSION_STRING="${OBN_VERSION}"
+        ABI_VERSION=${OBN_ABI_VERSION_HEX})
+    if(WIN32)
+        target_link_libraries(receipt_store_test PRIVATE ws2_32)
+    endif()
+    add_test(NAME receipt_store COMMAND receipt_store_test)
+    set_tests_properties(receipt_store PROPERTIES TIMEOUT 60)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
