@@ -254,6 +254,17 @@ Response perform(const Request& req)
         curl_easy_setopt(curl, CURLOPT_CAINFO, req.ca_file.c_str());
     }
 
+#if defined(_WIN32) && defined(CURLSSLOPT_NO_REVOCATION)
+    // Schannel checks certificate revocation (CRL/OCSP) online during every
+    // TLS handshake by default; when that lookup is unreachable the whole
+    // handshake fails with CRYPT_E_REVOCATION_OFFLINE (0x80092013) and every
+    // API call dies with "SSL connect error" (issues #26, #27). Skip the
+    // online lookup only; chain and hostname verification stay on, matching
+    // what browsers do with revocation data they cannot fetch.
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS,
+                     static_cast<long>(CURLSSLOPT_NO_REVOCATION));
+#endif
+
     OBN_DEBUG("http %s %s (body=%zu)",
               method_verb(req.method), req.url.c_str(), req.body.size());
 
