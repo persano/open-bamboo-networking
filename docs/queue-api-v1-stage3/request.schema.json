@@ -1,0 +1,472 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DRAFT stage-3 requests ONLY; stage-2 requests remain unchanged",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "const": "command.submit"
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "submission_scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "idempotency_key": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "command": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "print"
+                    },
+                    "device_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "payload": {
+                      "type": "object",
+                      "properties": {
+                        "file": {
+                          "type": "object",
+                          "properties": {
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 32767
+                            },
+                            "sha256": {
+                              "type": "string",
+                              "pattern": "^[a-f0-9]{64}$"
+                            },
+                            "plate_index": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 1024
+                            }
+                          },
+                          "required": [
+                            "path",
+                            "sha256",
+                            "plate_index"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "task_tag": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "supply": {
+                          "enum": [
+                            "ams",
+                            "external"
+                          ]
+                        },
+                        "materials": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "source_filament_id": {
+                                "type": "string",
+                                "pattern": "^[0-9]+$",
+                                "maxLength": 8
+                              },
+                              "slot_id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128
+                              },
+                              "type": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 64
+                              },
+                              "profile_id": {
+                                "type": "string",
+                                "maxLength": 128
+                              },
+                              "source_color": {
+                                "type": "string",
+                                "pattern": "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$"
+                              },
+                              "target_color": {
+                                "type": "string",
+                                "pattern": "^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$"
+                              }
+                            },
+                            "required": [
+                              "source_filament_id",
+                              "slot_id",
+                              "type",
+                              "profile_id",
+                              "source_color",
+                              "target_color"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "minItems": 1,
+                          "maxItems": 64,
+                          "uniqueItems": true
+                        },
+                        "options": {
+                          "type": "object",
+                          "properties": {
+                            "bed_leveling": {
+                              "type": "boolean"
+                            },
+                            "flow_calibration": {
+                              "type": "boolean"
+                            },
+                            "timelapse": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "bed_leveling",
+                            "flow_calibration",
+                            "timelapse"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "task_tag",
+                        "supply",
+                        "materials",
+                        "options"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "device_id",
+                    "payload"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "print"
+                    },
+                    "device_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "payload": {
+                      "type": "object",
+                      "properties": {
+                        "file": {
+                          "type": "object",
+                          "properties": {
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 32767
+                            },
+                            "sha256": {
+                              "type": "string",
+                              "pattern": "^[a-f0-9]{64}$"
+                            },
+                            "plate_index": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 1024
+                            }
+                          },
+                          "required": [
+                            "path",
+                            "sha256",
+                            "plate_index"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "task_tag": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "supply": {
+                          "const": "none"
+                        },
+                        "materials": {
+                          "type": "array",
+                          "maxItems": 0
+                        },
+                        "options": {
+                          "type": "object",
+                          "properties": {
+                            "bed_leveling": {
+                              "const": false
+                            },
+                            "flow_calibration": {
+                              "const": false
+                            },
+                            "timelapse": {
+                              "const": false
+                            }
+                          },
+                          "required": [
+                            "bed_leveling",
+                            "flow_calibration",
+                            "timelapse"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "task_tag",
+                        "supply",
+                        "materials",
+                        "options"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "device_id",
+                    "payload"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "pause",
+                        "resume",
+                        "stop"
+                      ]
+                    },
+                    "device_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "expected_job_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "device_id",
+                    "expected_job_id"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "skip_objects"
+                    },
+                    "device_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "expected_job_id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "object_ids": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                      },
+                      "minItems": 1,
+                      "maxItems": 256,
+                      "uniqueItems": true
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "device_id",
+                    "expected_job_id",
+                    "object_ids"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "submission_scope",
+            "idempotency_key",
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "op",
+        "client_id",
+        "session_epoch",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "const": "command.get"
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "submission_scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "idempotency_key": {
+              "type": "string",
+              "minLength": 16,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            }
+          },
+          "required": [
+            "submission_scope",
+            "idempotency_key"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "op",
+        "client_id",
+        "session_epoch",
+        "params"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "api": {
+          "const": 1
+        },
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "op": {
+          "const": "job.get"
+        },
+        "client_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "session_epoch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "params": {
+          "type": "object",
+          "properties": {
+            "submission_scope": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "device_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "job_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "submission_scope",
+            "device_id",
+            "job_id"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "api",
+        "request_id",
+        "op",
+        "client_id",
+        "session_epoch",
+        "params"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

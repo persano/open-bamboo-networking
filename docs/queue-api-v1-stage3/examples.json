@@ -1,0 +1,554 @@
+[
+  {
+    "name": "submit-ams",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command": {
+          "kind": "print",
+          "device_id": "printer-A",
+          "payload": {
+            "file": {
+              "path": "C:\\Queue\\零件.gcode.3mf",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "plate_index": 1
+            },
+            "task_tag": "queue-item-001",
+            "supply": "ams",
+            "materials": [
+              {
+                "source_filament_id": "9",
+                "slot_id": "ams-0-slot-3",
+                "type": "PETG",
+                "profile_id": "example-profile",
+                "source_color": "#FFFFFF",
+                "target_color": "#FFFFFF"
+              }
+            ],
+            "options": {
+              "bed_leveling": true,
+              "flow_calibration": false,
+              "timelapse": false
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "retry-new-request-same-key",
+    "request": {
+      "api": 1,
+      "request_id": "request-retry",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command": {
+          "kind": "print",
+          "device_id": "printer-A",
+          "payload": {
+            "file": {
+              "path": "C:\\Queue\\零件.gcode.3mf",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "plate_index": 1
+            },
+            "task_tag": "queue-item-001",
+            "supply": "ams",
+            "materials": [
+              {
+                "source_filament_id": "9",
+                "slot_id": "ams-0-slot-3",
+                "type": "PETG",
+                "profile_id": "example-profile",
+                "source_color": "#FFFFFF",
+                "target_color": "#FFFFFF"
+              }
+            ],
+            "options": {
+              "bed_leveling": true,
+              "flow_calibration": false,
+              "timelapse": false
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-retry",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "recover-receipt",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.get",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001"
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.get",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-001",
+        "state": "succeeded",
+        "dispatch": "confirmed",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "job-terminal-lookup",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "job.get",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "device_id": "printer-A",
+        "job_id": "job-001"
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "job.get",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "job": {
+          "job_id": "job-001",
+          "device_id": "printer-A",
+          "state": "completed",
+          "started_at": "2026-11-21T10:01:00Z",
+          "terminal": {
+            "state": "completed",
+            "error_code": 0,
+            "observed_at": "2026-11-21T11:00:00Z",
+            "source": "printer_report",
+            "correlation": "matched",
+            "connection_generation": "connection-1",
+            "quiescent": true
+          },
+          "job_key": "native-task-001",
+          "task_tag": "queue-item-001",
+          "origin": "unknown",
+          "progress_percent": 100
+        }
+      }
+    }
+  },
+  {
+    "name": "pause",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-pause-00000001",
+        "command": {
+          "kind": "pause",
+          "device_id": "printer-A",
+          "expected_job_id": "job-001"
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-pause-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "pause",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "resume",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-resume-00000001",
+        "command": {
+          "kind": "resume",
+          "device_id": "printer-A",
+          "expected_job_id": "job-001"
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-resume-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "resume",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "stop",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-stop-00000001",
+        "command": {
+          "kind": "stop",
+          "device_id": "printer-A",
+          "expected_job_id": "job-001"
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-stop-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "stop",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "skip_objects",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-skip_objects-00000001",
+        "command": {
+          "kind": "skip_objects",
+          "device_id": "printer-A",
+          "expected_job_id": "job-001",
+          "object_ids": [
+            "native-object-7"
+          ]
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "control-skip_objects-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "skip_objects",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "external-spool",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "external-00000001",
+        "command": {
+          "kind": "print",
+          "device_id": "printer-A",
+          "payload": {
+            "file": {
+              "path": "C:\\Queue\\零件.gcode.3mf",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "plate_index": 1
+            },
+            "task_tag": "queue-item-001",
+            "supply": "external",
+            "materials": [
+              {
+                "source_filament_id": "9",
+                "slot_id": "external",
+                "type": "PETG",
+                "profile_id": "example-profile",
+                "source_color": "#FFFFFF",
+                "target_color": "#FFFFFF"
+              }
+            ],
+            "options": {
+              "bed_leveling": true,
+              "flow_calibration": false,
+              "timelapse": false
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "external-00000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-001",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "mechanical-ordinary-print",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "mechanical-000001",
+        "command": {
+          "kind": "print",
+          "device_id": "printer-A",
+          "payload": {
+            "file": {
+              "path": "C:\\Queue\\换盘.gcode.3mf",
+              "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "plate_index": 1
+            },
+            "task_tag": "queue-item-001",
+            "supply": "none",
+            "materials": [],
+            "options": {
+              "bed_leveling": false,
+              "flow_calibration": false,
+              "timelapse": false
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": true,
+      "result": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "mechanical-000001",
+        "command_id": "command-001",
+        "device_id": "printer-A",
+        "kind": "print",
+        "job_id": "job-002",
+        "state": "accepted",
+        "dispatch": "not_sent",
+        "accepted_at": "2026-11-21T10:00:00Z",
+        "updated_at": "2026-11-21T10:00:00Z",
+        "error": null
+      }
+    }
+  },
+  {
+    "name": "conflicting-key",
+    "request": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "client_id": "client-A",
+      "session_epoch": "epoch-A",
+      "params": {
+        "submission_scope": "scope-A",
+        "idempotency_key": "queue-job-00000001",
+        "command": {
+          "kind": "print",
+          "device_id": "printer-A",
+          "payload": {
+            "file": {
+              "path": "C:\\Queue\\零件.gcode.3mf",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "plate_index": 1
+            },
+            "task_tag": "queue-item-001",
+            "supply": "external",
+            "materials": [
+              {
+                "source_filament_id": "9",
+                "slot_id": "ams-0-slot-3",
+                "type": "PETG",
+                "profile_id": "example-profile",
+                "source_color": "#FFFFFF",
+                "target_color": "#FFFFFF"
+              }
+            ],
+            "options": {
+              "bed_leveling": true,
+              "flow_calibration": false,
+              "timelapse": false
+            }
+          }
+        }
+      }
+    },
+    "response": {
+      "api": 1,
+      "request_id": "request-001",
+      "op": "command.submit",
+      "instance_id": "instance-A",
+      "session_epoch": "epoch-A",
+      "capabilities_revision": "stage3-draft-1",
+      "ok": false,
+      "error": {
+        "code": "idempotency_conflict",
+        "message": "Key already reserved for another payload.",
+        "retryable": false
+      }
+    }
+  }
+]

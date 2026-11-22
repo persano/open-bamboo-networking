@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DRAFT additive printer fields",
+  "type": "object",
+  "properties": {
+    "nozzle_diameter": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "command_support": {
+      "type": "object",
+      "properties": {
+        "command_kinds": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "print",
+              "pause",
+              "resume",
+              "stop",
+              "skip_objects"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 5,
+          "uniqueItems": true
+        },
+        "print_options": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "bed_leveling",
+              "flow_calibration",
+              "timelapse"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 3,
+          "uniqueItems": true
+        },
+        "supply_modes": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "ams",
+              "external",
+              "none"
+            ]
+          },
+          "minItems": 0,
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "command_kinds",
+        "print_options",
+        "supply_modes"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "nozzle_diameter",
+    "command_support"
+  ],
+  "additionalProperties": true
+}
