@@ -3207,6 +3207,15 @@ std::string Agent::lan_access_code_for(const std::string& dev_id) const
     return {};
 }
 
+std::string Agent::lan_ip_for(const std::string& dev_id) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto                        it = lan_ip_by_dev_.find(dev_id);
+    if (it != lan_ip_by_dev_.end()) return it->second;
+    if (lan_session_ && lan_session_->dev_id() == dev_id) return lan_session_->dev_ip();
+    return {};
+}
+
 std::string Agent::device_display_name_for_ip(const std::string& dev_ip) const
 {
     const std::string ip = trim_ip_string(dev_ip);

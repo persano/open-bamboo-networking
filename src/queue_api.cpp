@@ -1,6 +1,9 @@
 // Versioned queue integration API (stage 2): capability discovery,
 // read-only multi-printer snapshots and polled events behind the two C
-// exports declared in include/obn/obn_queue_api_v1.h.
+// exports declared in include/obn/obn_queue_api_v1.h. Stage 3 adds the
+// capability-gated command.submit / command.get / job.get operations
+// backed by the durable per-account receipt store
+// (docs/queue-api-v1-stage3/README.md).
 // Design: persano/open-bambu-networking-plugin issue #16.
 
 #define OBN_QUEUE_API_BUILD
@@ -10,7 +13,14 @@
 
 #include "obn/agent.hpp"
 #include "obn/auth.hpp"
+#include "obn/bambu_networking.hpp"
+#include "obn/config.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/log.hpp"
+#include "obn/mqtt_seq.hpp"
+#include "obn/receipt_store.hpp"
+
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <chrono>
@@ -20,12 +30,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <initializer_list>
 #include <map>
 #include <mutex>
 #include <new>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace obn::queue {
@@ -46,7 +58,66 @@ constexpr std::size_t kMaxMergedBytes      = 65536;
 constexpr std::size_t kMaxRequestBytes     = 65536;
 constexpr std::size_t kMaxResponseBudget   = 1900000; // headroom under 2 MiB
 constexpr int         kMaxRequestDepth     = 32;
-constexpr char        kCapRev[]            = "c1";
+constexpr char        kCapRev[]            = "stage3-draft-1";
+
+// --- Stage-3 command submission state (see docs/queue-api-v1-stage3) ------
+// One physical print lane per device: an accepted queue print owns the
+// device until its receipt fails/cancels before dispatch or a device
+// frame shows the job ended (or no job at all, once dispatched).
+struct LaneEntry {
+    std::string key;       // owning idempotency key
+    bool        dispatched = false; // may_have_been_sent durably recorded
+};
+// Serializes dedup + lane check + reservation + lane claim so two keys
+// cannot both claim one device's lane between check and reserve.
+// Lock order: ingest_frame takes reg().mu then g_submit_mu; command
+// submission never takes reg().mu while holding g_submit_mu.
+std::mutex g_submit_mu;
+std::map<std::string, LaneEntry> g_print_lanes; // device_id -> lane
+
+#ifdef OBN_TESTING
+// Test seams (queue_api.hpp): inject session/config for the receipt
+// store and suppress worker dispatch. Absent from production builds.
+auth::Session g_test_session;
+std::string   g_test_config_dir;
+bool          g_test_session_set = false;
+bool          g_test_dispatch_on = true;
+#endif
+
+bool dispatch_enabled()
+{
+#ifdef OBN_TESTING
+    return g_test_dispatch_on;
+#else
+    return true;
+#endif
+}
+
+// Stage-3 advertised command surface (global capabilities and per-printer
+// command_support): skip_objects and supply "none" stay unadvertised
+// until their validation subsets exist (README: keep unsupported until
+// agreed).
+json::Array command_kinds_array()
+{
+    json::Array a;
+    for (const char* k : {"print", "pause", "resume", "stop"})
+        a.push_back(json::Value(k));
+    return a;
+}
+json::Array print_options_array()
+{
+    json::Array a;
+    for (const char* k : {"bed_leveling", "flow_calibration", "timelapse"})
+        a.push_back(json::Value(k));
+    return a;
+}
+json::Array supply_modes_array()
+{
+    json::Array a;
+    for (const char* k : {"ams", "external"})
+        a.push_back(json::Value(k));
+    return a;
+}
 
 // ---------------------------------------------------------------------------
 // Request pre-validation: malformed UTF-8, embedded NUL (checked by caller),
@@ -576,6 +647,14 @@ json::Value build_printer_locked(const std::string& dev_id,
     }
     p["nozzle_diameter"] = std::move(nozzle_d);
 
+    // Per-printer command support (stage-3 additive field): what the
+    // queue may submit to this printer right now.
+    json::Object cs;
+    cs["command_kinds"]  = json::Value(command_kinds_array());
+    cs["print_options"]  = json::Value(print_options_array());
+    cs["supply_modes"]   = json::Value(supply_modes_array());
+    p["command_support"] = json::Value(std::move(cs));
+
     return json::Value(std::move(p));
 }
 
@@ -747,6 +826,24 @@ void ingest_frame(const std::string& dev_id, const std::string& json_text)
 
     const json::Value& merged_print = d.merged.find("print");
     const std::string  gcode = merged_print.find("gcode_state").as_string();
+
+    // Release the stage-3 print lane on job-end evidence: any terminal
+    // job state, or an explicit IDLE frame once the receipt crossed the
+    // dispatch marker (an uncertain dispatch that never started shows
+    // IDLE forever). Accepted-but-undispatched lanes stay: the worker
+    // owns those releases. Lock order: reg().mu then g_submit_mu.
+    {
+        const std::string jst = job_state_of(gcode);
+        const bool terminal = jst == "completed" || jst == "failed" || jst == "cancelled";
+        if (terminal || gcode == "IDLE") {
+            std::lock_guard<std::mutex> sl(g_submit_mu);
+            auto lit = g_print_lanes.find(dev_id);
+            if (lit != g_print_lanes.end() &&
+                (terminal || lit->second.dispatched))
+                g_print_lanes.erase(lit);
+        }
+    }
+
     const bool         watched = watched_by_any_locked(r, dev_id);
     if (!watched) return;
 
@@ -848,6 +945,137 @@ void note_devices_from_cloud(const std::string& raw_body)
 
 namespace { // dispatch internals
 
+// ---------------------------------------------------------------------------
+// Stage-3 command plumbing (docs/queue-api-v1-stage3): receipt-store
+// access, canonical fingerprints, response mapping, strict request
+// validation, and the worker threads that cross the dispatch boundary
+// off the calling thread.
+// ---------------------------------------------------------------------------
+
+// Fresh-frame bound for dispatch-time device checks: push_status cadence
+// is seconds, so a two-minute-old frame means the printer is not
+// reporting (contract: stale_status before dispatch).
+constexpr std::chrono::milliseconds kFreshFrameMs{120000};
+
+// Opens the durable receipt store for the currently authorized account.
+// *err receives a contract error code ("signed_out" when no session,
+// "submission_store_unavailable" otherwise) when this returns nullptr.
+std::unique_ptr<ReceiptStore> open_store(std::string* err)
+{
+#ifdef OBN_TESTING
+    if (g_test_session_set) {
+        if (!g_test_session.logged_in()) {
+            *err = "signed_out";
+            return nullptr;
+        }
+        std::string oerr;
+        auto st = ReceiptStore::open(g_test_config_dir, g_test_session.user_id, &oerr);
+        if (!st) *err = "submission_store_unavailable";
+        return st;
+    }
+#endif
+    Agent* a = Agent::active_instance();
+    if (!a) {
+        *err = "signed_out";
+        return nullptr;
+    }
+    const auth::Session s = a->user_session_snapshot();
+    if (!s.logged_in()) {
+        *err = "signed_out";
+        return nullptr;
+    }
+    if (config::dir().empty()) {
+        *err = "submission_store_unavailable";
+        return nullptr;
+    }
+    std::string oerr;
+    auto st = ReceiptStore::open(config::dir(), s.user_id, &oerr);
+    if (!st) *err = "submission_store_unavailable";
+    return st;
+}
+
+bool valid_idem_key(const json::Value& v)
+{
+    if (!bounded_string(v, 16, 128)) return false;
+    for (const char c : v.as_string()) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '.' || c == '_' ||
+                        c == ':' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+std::string to_hex_lower(const unsigned char* d, unsigned n)
+{
+    static const char kHex[] = "0123456789abcdef";
+    std::string out(n * 2, '\0');
+    for (unsigned i = 0; i < n; ++i) {
+        out[2 * i]     = kHex[(d[i] >> 4) & 0xF];
+        out[2 * i + 1] = kHex[d[i] & 0xF];
+    }
+    return out;
+}
+
+std::string sha256_hex(const std::string& data)
+{
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return {};
+    std::string out;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned      len = 0;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+        EVP_DigestUpdate(ctx, data.data(), data.size()) == 1 &&
+        EVP_DigestFinal_ex(ctx, md, &len) == 1 && len > 0)
+        out = to_hex_lower(md, len);
+    EVP_MD_CTX_free(ctx);
+    return out;
+}
+
+// Streaming SHA-256 over a file: stage-3 verifies the consumer's hash
+// before crossing the dispatch boundary. Returns "" on any failure and
+// sets *exists=false when the file cannot be opened at all.
+std::string sha256_file_hex(const std::string& path, bool* exists)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        if (exists) *exists = false;
+        return {};
+    }
+    if (exists) *exists = true;
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return {};
+    std::string out;
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1) {
+        bool bad = false;
+        char buf[64 * 1024];
+        while (in) {
+            in.read(buf, sizeof(buf));
+            const auto n = in.gcount();
+            if (n > 0 && EVP_DigestUpdate(ctx, buf, static_cast<std::size_t>(n)) != 1) {
+                bad = true;
+                break;
+            }
+        }
+        if (!in.eof()) bad = true; // short read that is not EOF
+        unsigned char md[EVP_MAX_MD_SIZE];
+        unsigned      len = 0;
+        if (!bad && EVP_DigestFinal_ex(ctx, md, &len) == 1 && len > 0)
+            out = to_hex_lower(md, len);
+    }
+    EVP_MD_CTX_free(ctx);
+    return out;
+}
+
+// Canonical fingerprint: SHA-256 over the re-dumped command object.
+// json::Object is an ordered map, so member order and whitespace
+// normalize away; array order and values stay significant (contract
+// rule 2).
+std::string command_fingerprint(const json::Value& command)
+{
+    return sha256_hex(command.dump());
+}
+
 json::Value capabilities_result()
 {
     json::Object res;
@@ -858,11 +1086,28 @@ json::Value capabilities_result()
 
     json::Array ops;
     for (const char* o : {"capabilities", "client.open", "client.close", "devices.list",
-                          "watch.set", "snapshot.get", "events.poll"})
+                          "watch.set", "snapshot.get", "events.poll",
+                          "command.submit", "command.get", "job.get"})
         ops.push_back(json::Value(o));
     res["operations"] = json::Value(std::move(ops));
 
-    res["command_kinds"] = json::Value(json::Array{});
+    res["command_kinds"] = json::Value(command_kinds_array());
+    res["command_protocol_revision"] = json::Value("stage3-draft-1");
+
+    // Durable submission contract (capability-additions.schema.json).
+    // scope is null while signed out or when the store cannot open;
+    // consumers must re-read capabilities after session changes.
+    json::Object sub;
+    {
+        std::string err;
+        auto st = open_store(&err);
+        sub["scope"] = st ? json::Value(st->scope()) : json::Value(nullptr);
+    }
+    sub["idempotency"]           = json::Value("durable_at_most_once_dispatch");
+    sub["receipt_retention"]     = json::Value("until_explicit_store_reset");
+    sub["max_retained_keys"]     = json::Value(static_cast<double>(ReceiptStore::kMaxKeys));
+    sub["max_pending_per_device"] = json::Value(1.0);
+    res["submission"] = json::Value(std::move(sub));
 
     json::Array features;
     features.push_back(json::Value("multi_printer"));
@@ -883,6 +1128,556 @@ json::Value capabilities_result()
 
     res["session_state"] = json::Value(session_state());
     return json::Value(std::move(res));
+}
+
+// Read-only view of a device's latest status for the command path.
+struct DeviceSnap {
+    bool          known = false;
+    bool          have_frame = false;
+    bool          busy = false;
+    long long     age_ms = 0;
+    std::uint64_t conn_seq = 0;
+    json::Value   print{json::Object{}};
+};
+
+DeviceSnap snapshot_device(const std::string& dev)
+{
+    DeviceSnap s;
+    Registry&  r = reg();
+    std::lock_guard<std::mutex> lk(r.mu);
+    const auto it = r.devices.find(dev);
+    if (it == r.devices.end()) return s;
+    s.known = true;
+    const DeviceState& d = it->second;
+    s.conn_seq = d.conn_seq;
+    if (!d.has_frame) return s;
+    s.have_frame = true;
+    s.age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   Clock::now() - d.last_frame).count();
+    if (s.age_ms < 0) s.age_ms = 0;
+    const json::Value& pv = d.merged.find("print");
+    s.print = pv.is_object() ? pv : json::Value(json::Object{});
+    s.busy  = printer_state_of(d.online, s.print.find("gcode_state").as_string()) == "busy";
+    return s;
+}
+
+std::string rec_str(const json::Object& rec, const char* k, const char* fb = "")
+{
+    const auto it = rec.find(k);
+    return (it != rec.end() && it->second.is_string()) ? it->second.as_string()
+                                                       : std::string(fb);
+}
+
+// command.submit / command.get result: the receipt shape from
+// response.schema.json ($defs/receipt).
+json::Value receipt_result(const std::string& scope, const json::Object& rec)
+{
+    json::Object o;
+    o["submission_scope"] = json::Value(scope);
+    o["idempotency_key"]  = json::Value(rec_str(rec, "k"));
+    o["command_id"]       = json::Value(rec_str(rec, "cid"));
+    o["device_id"]        = json::Value(rec_str(rec, "dev"));
+    o["kind"]             = json::Value(rec_str(rec, "kind"));
+    o["job_id"]           = json::Value(rec_str(rec, "jid"));
+    o["state"]            = json::Value(rec_str(rec, "state", "accepted"));
+    o["dispatch"]         = json::Value(rec_str(rec, "dispatch", "not_sent"));
+    const std::string ts  = rec_str(rec, "ts");
+    o["accepted_at"]      = json::Value(rec_str(rec, "acc", ts.c_str()));
+    o["updated_at"]       = json::Value(ts);
+    const auto err = rec.find("err");
+    o["error"] = (err != rec.end() && err->second.is_object()) ? err->second
+                                                               : json::Value(nullptr);
+    return json::Value(std::move(o));
+}
+
+// job.get result (response.schema.json $defs/job). Receipt -> job state
+// mapping without printer correlation yet: only a not_sent failure or
+// cancellation proves the job never ran; anything past the dispatch
+// marker stays "unknown" until frame evidence lands (shortcut: live
+// frame correlation is a later step, covered by acceptance).
+json::Value job_result(const std::string& scope, const json::Object& rec,
+                       const DeviceSnap& snap)
+{
+    const std::string state    = rec_str(rec, "state", "accepted");
+    const std::string dispatch = rec_str(rec, "dispatch", "not_sent");
+    const std::string ts       = rec_str(rec, "ts");
+
+    std::string js;
+    if (state == "accepted")       js = "pending";
+    else if (state == "working")   js = "preparing";
+    else if (state == "succeeded") js = "printing"; // dispatch acknowledged
+    else if (state == "failed")
+        js = dispatch == "not_sent" ? "failed" : "unknown";
+    else if (state == "cancelled")
+        js = dispatch == "not_sent" ? "cancelled" : "unknown";
+    else js = "unknown";
+
+    json::Object j;
+    j["job_id"]     = json::Value(rec_str(rec, "jid"));
+    j["device_id"]  = json::Value(rec_str(rec, "dev"));
+    j["state"]      = json::Value(js);
+    j["started_at"] = (js == "printing" && !ts.empty()) ? json::Value(ts)
+                                                        : json::Value(nullptr);
+    if (js == "failed" || js == "cancelled") {
+        json::Object t;
+        t["state"]                 = json::Value(js);
+        t["error_code"]            = json::Value(nullptr); // no printer code observed
+        t["observed_at"]           = json::Value(ts);
+        t["source"]                = json::Value("unknown");
+        t["correlation"]           = json::Value("unverified");
+        t["connection_generation"] =
+            json::Value("connection-" + std::to_string(snap.conn_seq));
+        // quiescent needs native end-of-execution proof, never receipt
+        // evidence alone (contract quiescent gate): stay false.
+        t["quiescent"] = json::Value(false);
+        j["terminal"]  = json::Value(std::move(t));
+    } else {
+        j["terminal"] = json::Value(nullptr);
+    }
+    const std::string tag = rec_str(rec, "tag");
+    j["task_tag"]         = tag.empty() ? json::Value(nullptr) : json::Value(tag);
+    j["origin"]           = json::Value("unknown");
+    j["progress_percent"] = json::Value(nullptr);
+
+    json::Object res;
+    res["submission_scope"] = json::Value(scope);
+    res["job"]              = json::Value(std::move(j));
+    return json::Value(std::move(res));
+}
+
+bool receipt_update(ReceiptStore* st, const std::string& key,
+                    json::Object patch, const char* what)
+{
+    std::string e;
+    if (!st->update(key, patch, &e)) {
+        OBN_WARN("queue: receipt update (%s) failed key=%s: %s",
+                 what, key.c_str(), e.c_str());
+        return false;
+    }
+    return true;
+}
+
+// g_submit_mu must be held by the caller.
+void lane_release_if_own(const std::string& dev, const std::string& key)
+{
+    const auto it = g_print_lanes.find(dev);
+    if (it != g_print_lanes.end() && it->second.key == key)
+        g_print_lanes.erase(it);
+}
+
+// One validated command.submit payload. `command` keeps the as-parsed
+// object: it is the fingerprint source.
+struct SubmitCommand {
+    std::string kind; // print | pause | resume | stop
+    std::string device_id;
+    json::Value command;
+    // print payload
+    std::string file_path;
+    std::string file_sha256;
+    int         plate_index = 1;
+    std::string task_tag;
+    std::string supply;
+    json::Value materials{json::Array{}};
+    bool        bed_leveling     = false;
+    bool        flow_calibration = false;
+    bool        timelapse        = false;
+    // control
+    std::string expected_job_id;
+};
+
+bool valid_color(const json::Value& v)
+{
+    if (!v.is_string()) return false;
+    const std::string& s = v.as_string();
+    if ((s.size() != 7 && s.size() != 9) || s[0] != '#') return false;
+    for (std::size_t i = 1; i < s.size(); ++i) {
+        const char c = s[i];
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                        (c >= 'A' && c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// "ams-<N>-slot-<M>" with N in 0..255 and M in 0..3 (four trays per
+// unit: the flat mapping's linear index is ams*4+tray).
+bool parse_slot_id(const std::string& s, int* ams, int* tray)
+{
+    if (s.rfind("ams-", 0) != 0) return false;
+    const auto pos = s.find("-slot-", 4);
+    if (pos == std::string::npos) return false;
+    const std::string a = s.substr(4, pos - 4);
+    const std::string t = s.substr(pos + 6);
+    if (a.empty() || t.empty()) return false;
+    for (const char c : a) if (c < '0' || c > '9') return false;
+    for (const char c : t) if (c < '0' || c > '9') return false;
+    try {
+        *ams  = std::stoi(a);
+        *tray = std::stoi(t);
+    } catch (...) {
+        return false;
+    }
+    return *ams >= 0 && *ams <= 255 && *tray >= 0 && *tray <= 3;
+}
+
+// Strict stage-3 request validation (request.schema.json): exact key
+// sets everywhere, bounded strings, pattern checks. Returns false with
+// *err/*code for the error envelope; *code is "not_supported" for a
+// shape that parses but is not advertised.
+bool parse_command(const json::Value& cmd, SubmitCommand* out,
+                   std::string* err, const char** code)
+{
+    *code = "invalid_request";
+    if (!cmd.is_object()) {
+        *err = "command must be an object";
+        return false;
+    }
+    const json::Object& co   = cmd.as_object();
+    const std::string   kind = gv(co, "kind").as_string();
+    if (kind == "skip_objects") {
+        *code = "not_supported";
+        *err  = "command kind skip_objects is not advertised";
+        return false;
+    }
+    if (kind != "print" && kind != "pause" && kind != "resume" && kind != "stop") {
+        *err = "command.kind must be print, pause, resume or stop";
+        return false;
+    }
+    out->kind = kind;
+
+    std::string e;
+    if (kind != "print") {
+        if (!exact_keys(co, {"kind", "device_id", "expected_job_id"}, e)) {
+            *err = e;
+            return false;
+        }
+        const json::Value& dev = gv(co, "device_id");
+        if (!valid_device_id(dev)) {
+            *err = "device_id must be a string of 1..128 bytes";
+            return false;
+        }
+        out->device_id = dev.as_string();
+        const json::Value& exp = gv(co, "expected_job_id");
+        if (!bounded_string(exp, 1, 128)) {
+            *err = "expected_job_id must be a string of 1..128 bytes";
+            return false;
+        }
+        out->expected_job_id = exp.as_string();
+        out->command         = cmd;
+        return true;
+    }
+
+    if (!exact_keys(co, {"kind", "device_id", "payload"}, e)) {
+        *err = e;
+        return false;
+    }
+    const json::Value& dev = gv(co, "device_id");
+    if (!valid_device_id(dev)) {
+        *err = "device_id must be a string of 1..128 bytes";
+        return false;
+    }
+    out->device_id = dev.as_string();
+
+    const json::Value& payload = gv(co, "payload");
+    if (!payload.is_object()) {
+        *err = "payload must be an object";
+        return false;
+    }
+    const json::Object& po = payload.as_object();
+    if (!exact_keys(po, {"file", "task_tag", "supply", "materials", "options"}, e)) {
+        *err = e;
+        return false;
+    }
+
+    const json::Value& file = gv(po, "file");
+    if (!file.is_object()) {
+        *err = "payload.file must be an object";
+        return false;
+    }
+    if (!exact_keys(file.as_object(), {"path", "sha256", "plate_index"}, e)) {
+        *err = e;
+        return false;
+    }
+    const json::Value& path = gv(file.as_object(), "path");
+    if (!bounded_string(path, 1, 32767)) {
+        *err = "file.path must be a string of 1..32767 bytes";
+        return false;
+    }
+    out->file_path = path.as_string();
+    const json::Value& sha = gv(file.as_object(), "sha256");
+    if (!bounded_string(sha, 64, 64)) {
+        *err = "file.sha256 must be 64 lowercase hex chars";
+        return false;
+    }
+    for (const char c : sha.as_string()) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            *err = "file.sha256 must be 64 lowercase hex chars";
+            return false;
+        }
+    }
+    out->file_sha256 = sha.as_string();
+    long long plate  = 0;
+    if (!int_in(gv(file.as_object(), "plate_index"), 1, 1024, &plate)) {
+        *err = "file.plate_index must be an integer in 1..1024";
+        return false;
+    }
+    out->plate_index = static_cast<int>(plate);
+
+    if (!bounded_string(gv(po, "task_tag"), 1, 128)) {
+        *err = "task_tag must be a string of 1..128 bytes";
+        return false;
+    }
+    out->task_tag = gv(po, "task_tag").as_string();
+
+    const std::string supply = gv(po, "supply").as_string();
+    if (supply == "none") {
+        *code = "not_supported";
+        *err  = "supply mode none is not advertised";
+        return false;
+    }
+    if (supply != "ams" && supply != "external") {
+        *err = "supply must be \"ams\" or \"external\"";
+        return false;
+    }
+    out->supply = supply;
+
+    const json::Value& mats = gv(po, "materials");
+    if (!mats.is_array() || mats.as_array().size() < 1 ||
+        mats.as_array().size() > 64) {
+        *err = "materials must be an array of 1..64 entries";
+        return false;
+    }
+    std::vector<int> seen_ids;
+    for (const auto& m : mats.as_array()) {
+        if (!m.is_object()) {
+            *err = "materials entries must be objects";
+            return false;
+        }
+        if (!exact_keys(m.as_object(),
+                        {"source_filament_id", "slot_id", "type", "profile_id",
+                         "source_color", "target_color"}, e)) {
+            *err = e;
+            return false;
+        }
+        const json::Value& sid = gv(m.as_object(), "source_filament_id");
+        if (!bounded_string(sid, 1, 8)) {
+            *err = "source_filament_id must be a digit string of 1..8 chars";
+            return false;
+        }
+        int id_num = 0;
+        for (const char c : sid.as_string()) {
+            if (c < '0' || c > '9') {
+                *err = "source_filament_id must be a digit string of 1..8 chars";
+                return false;
+            }
+            id_num = id_num * 10 + (c - '0');
+        }
+        if (id_num > 1023) {
+            *err = "source_filament_id must be <= 1023";
+            return false;
+        }
+        if (std::find(seen_ids.begin(), seen_ids.end(), id_num) != seen_ids.end()) {
+            *err = "duplicate source_filament_id: " + sid.as_string();
+            return false;
+        }
+        seen_ids.push_back(id_num);
+        if (!bounded_string(gv(m.as_object(), "slot_id"), 1, 128)) {
+            *err = "slot_id must be a string of 1..128 bytes";
+            return false;
+        }
+        if (!bounded_string(gv(m.as_object(), "type"), 1, 64)) {
+            *err = "type must be a string of 1..64 bytes";
+            return false;
+        }
+        if (!bounded_string(gv(m.as_object(), "profile_id"), 0, 128)) {
+            *err = "profile_id must be a string of at most 128 bytes";
+            return false;
+        }
+        if (!valid_color(gv(m.as_object(), "source_color")) ||
+            !valid_color(gv(m.as_object(), "target_color"))) {
+            *err = "colors must match #RRGGBB or #RRGGBBAA";
+            return false;
+        }
+        if (supply == "ams") {
+            int ams = 0, tray = 0;
+            if (!parse_slot_id(gv(m.as_object(), "slot_id").as_string(), &ams, &tray)) {
+                *err = "slot_id must be ams-<N>-slot-<M> with N in 0..255, M in 0..3";
+                return false;
+            }
+        }
+    }
+    out->materials = mats;
+
+    const json::Value& opts = gv(po, "options");
+    if (!opts.is_object()) {
+        *err = "options must be an object";
+        return false;
+    }
+    if (!exact_keys(opts.as_object(), {"bed_leveling", "flow_calibration", "timelapse"}, e)) {
+        *err = e;
+        return false;
+    }
+    for (const char* k : {"bed_leveling", "flow_calibration", "timelapse"}) {
+        if (!gv(opts.as_object(), k).is_bool()) {
+            *err = std::string(k) + " must be a boolean";
+            return false;
+        }
+    }
+    out->bed_leveling     = gv(opts.as_object(), "bed_leveling").as_bool();
+    out->flow_calibration = gv(opts.as_object(), "flow_calibration").as_bool();
+    out->timelapse        = gv(opts.as_object(), "timelapse").as_bool();
+
+    out->command = cmd;
+    return true;
+}
+
+// materials -> per-source-id slot values: index = sliced source filament
+// id, value = linear AMS slot (ams*4+tray) or -1 for external. Sparse
+// ids are not list positions (contract): holes stay -1.
+bool build_mapping_values(const SubmitCommand& sc, std::vector<int>* vals,
+                          std::string* err)
+{
+    int                 max_id = -1;
+    std::map<int, int>  by_id;
+    for (const auto& m : sc.materials.as_array()) {
+        const std::string sid = gv(m.as_object(), "source_filament_id").as_string();
+        const int         id  = std::atoi(sid.c_str());
+        int               v   = -1;
+        if (sc.supply == "ams") {
+            int ams = 0, tray = 0;
+            if (!parse_slot_id(gv(m.as_object(), "slot_id").as_string(), &ams, &tray)) {
+                *err = "invalid slot_id: " + gv(m.as_object(), "slot_id").as_string();
+                return false;
+            }
+            v = ams * 4 + tray;
+        }
+        by_id[id] = v;
+        if (id > max_id) max_id = id;
+    }
+    vals->assign(static_cast<std::size_t>(max_id + 1), -1);
+    for (const auto& kv : by_id)
+        (*vals)[static_cast<std::size_t>(kv.first)] = kv.second;
+    return true;
+}
+
+std::string flat_mapping_json(const std::vector<int>& vals)
+{
+    std::string s = "[";
+    for (std::size_t i = 0; i < vals.size(); ++i) {
+        if (i) s += ',';
+        s += std::to_string(vals[i]);
+    }
+    return s + "]";
+}
+
+// Snake_case ams_mapping2 the way the printer's MQTT schema wants it
+// (PrintParams::ams_mapping2 is passed verbatim on the LAN path);
+// -1/external maps to the {255,0} sentinel, same as the cloud
+// conversion in cloud_print.cpp.
+std::string snake_mapping2_json(const std::vector<int>& vals)
+{
+    std::string s     = "[";
+    bool        first = true;
+    for (const int v : vals) {
+        if (!first) s += ',';
+        first       = false;
+        const int ams  = v < 0 ? 255 : v / 4;
+        const int slot = v < 0 ? 0 : v % 4;
+        s += "{\"ams_id\":" + std::to_string(ams) +
+             ",\"slot_id\":" + std::to_string(slot) + "}";
+    }
+    return s + "]";
+}
+
+// Every material slot must still exist in the device's latest frame
+// (contract: a slot removed after acceptance fails before dispatch).
+bool slots_present(const json::Value& print_v, const json::Value& materials)
+{
+    const json::Array slots = build_slots(print_v);
+    std::vector<std::string> ids;
+    ids.reserve(slots.size());
+    for (const auto& s : slots) ids.push_back(s.find("slot_id").as_string());
+    for (const auto& m : materials.as_array()) {
+        const std::string want = gv(m.as_object(), "slot_id").as_string();
+        if (std::find(ids.begin(), ids.end(), want) == ids.end()) return false;
+    }
+    return true;
+}
+
+bool build_print_params(const SubmitCommand& sc, Agent* a, BBL::PrintParams* p,
+                        std::string* err)
+{
+    std::vector<int> vals;
+    if (!build_mapping_values(sc, &vals, err)) return false;
+
+    *p                    = BBL::PrintParams{};
+    p->dev_id             = sc.device_id;
+    p->task_name          = sc.task_tag;
+    p->project_name       = sc.task_tag;
+    p->filename           = sc.file_path;
+    p->plate_index        = sc.plate_index;
+    p->dev_ip             = a->lan_ip_for(sc.device_id);
+    p->password           = a->lan_access_code_for(sc.device_id);
+    p->use_ssl_for_ftp    = true;
+    p->use_ssl_for_mqtt   = true;
+    p->task_bed_leveling      = sc.bed_leveling;
+    p->task_flow_cali         = sc.flow_calibration;
+    p->task_record_timelapse  = sc.timelapse;
+    p->task_vibration_cali    = false;
+    p->task_layer_inspect     = false;
+    p->task_use_ams           = sc.supply == "ams";
+    p->task_ext_change_assist = false;
+    p->try_emmc_print         = false;
+#if ABI_VERSION >= 0x020503
+    p->task_timelapse_use_internal = false;
+#endif
+    // Resolved policy ints mirror the user toggles (research/08.08:
+    // 0=off, 1=on; the booleans stay the user toggles).
+    p->auto_bed_leveling = sc.bed_leveling ? 1 : 0;
+    p->auto_flow_cali    = sc.flow_calibration ? 1 : 0;
+    p->auto_offset_cali  = 0;
+    p->ams_mapping  = flat_mapping_json(vals);
+    p->ams_mapping2 = snake_mapping2_json(vals);
+    return true;
+}
+
+// Mode selection mirrors abi_print.cpp's Studio entries: LanOnly stays
+// LAN, CloudOnly goes through /my/task, TryLanFirst (and the
+// MakerWorld-only mode, which a queue file never satisfies) tries LAN
+// first and falls back to the cloud.
+int run_print_job(Agent* a, const BBL::PrintParams& p)
+{
+    BBL::OnUpdateStatusFn ub = [](int, int, std::string) {};
+    BBL::WasCancelledFn   cb = [] { return false; };
+    using CPM = obn::config::CloudPrintMode;
+    const CPM mode = obn::config::current().cloud_print;
+    if (mode == CPM::LanOnly)
+        return a->run_local_print_job(p, ub, cb);
+    if (mode == CPM::CloudOnly)
+        return a->run_cloud_print_job(p, ub, cb, /*use_lan_channel=*/false);
+    int rc = a->run_local_print_job(p, ub, cb);
+    if (rc != 0)
+        rc = a->run_cloud_print_job(p, ub, cb, /*use_lan_channel=*/false);
+    return rc;
+}
+
+// A control's expected_job_id binds only to a live queued print receipt
+// for the same device (a failed/cancelled pre-dispatch job never ran
+// physically). Controls share the target's jid, so kind=="print" filters
+// them out.
+bool binds_job(ReceiptStore* st, const std::string& dev, const std::string& jid)
+{
+    json::Object found;
+    std::string  err;
+    return st->find_if(
+        [&](const json::Object& o) {
+            if (rec_str(o, "kind") != "print") return false;
+            if (rec_str(o, "dev") != dev) return false;
+            if (rec_str(o, "jid") != jid) return false;
+            const std::string s = rec_str(o, "state", "accepted");
+            return s != "failed" && s != "cancelled";
+        },
+        &found, &err);
 }
 
 // Field-level gate shared by every client-scoped op: exact top-level key
@@ -1249,6 +2044,550 @@ std::string op_events_poll(const json::Object& root, Meta& m)
     return success_env(m, json::Value(std::move(res)));
 }
 
+// Print worker: verifies the intent, then crosses the dispatch boundary
+// on this thread (contract: submit returns promptly; hashing, upload and
+// printer acknowledgement never run on the calling thread).
+void worker_print(std::string key, SubmitCommand sc, std::string epoch)
+{
+    std::string err;
+    auto store = open_store(&err);
+    if (!store) {
+        OBN_WARN("queue: print worker cannot open receipt store key=%s: %s",
+                 key.c_str(), err.c_str());
+        return; // stays accepted/not_sent: nothing dispatched
+    }
+    json::Object rec;
+    if (!store->get(key, &rec, &err)) {
+        // Another account or a reset store owns this directory now:
+        // never dispatch work the current session cannot account for.
+        OBN_WARN("queue: print worker receipt missing key=%s: %s",
+                 key.c_str(), err.c_str());
+        return;
+    }
+
+    auto release_lane = [&] {
+        std::lock_guard<std::mutex> lk(g_submit_mu);
+        lane_release_if_own(sc.device_id, key);
+    };
+    auto fail_pre = [&](const char* code, bool retryable, const char* what) {
+        json::Object errv;
+        errv["code"]      = json::Value(code);
+        errv["retryable"] = json::Value(retryable);
+        json::Object patch;
+        patch["state"]    = json::Value("failed");
+        patch["dispatch"] = json::Value("not_sent");
+        patch["err"]      = json::Value(std::move(errv));
+        receipt_update(store.get(), key, std::move(patch), what);
+        release_lane();
+    };
+    auto cancel_pre = [&](const char* what) {
+        json::Object patch;
+        patch["state"]    = json::Value("cancelled");
+        patch["dispatch"] = json::Value("not_sent");
+        receipt_update(store.get(), key, std::move(patch), what);
+        release_lane();
+    };
+
+    if (current_epoch() != epoch) {
+        cancel_pre("session replaced before dispatch");
+        return;
+    }
+
+    // File verification before any dispatch boundary: file errors are
+    // retained receipt failures, never uploads (contract).
+    bool               exists = false;
+    const std::string  digest = sha256_file_hex(sc.file_path, &exists);
+    if (!exists || digest.empty()) {
+        fail_pre("unsafe_file", false, "file missing or unreadable");
+        return;
+    }
+    if (digest != sc.file_sha256) {
+        fail_pre("file_changed", false, "file hash mismatch");
+        return;
+    }
+
+    Agent* a = Agent::active_instance();
+    if (!a || !a->user_session_snapshot().logged_in() || current_epoch() != epoch) {
+        cancel_pre("session replaced before dispatch");
+        return;
+    }
+
+    const DeviceSnap snap = snapshot_device(sc.device_id);
+    if (!snap.known || !snap.have_frame || snap.age_ms > kFreshFrameMs.count()) {
+        fail_pre("stale_status", true, "no fresh device status");
+        return;
+    }
+    if (snap.busy) {
+        fail_pre("busy", true, "printer busy at dispatch");
+        return;
+    }
+    if (sc.supply == "ams" && !slots_present(snap.print, sc.materials)) {
+        fail_pre("invalid_mapping", false, "material slot not present on device");
+        return;
+    }
+
+    // Lane recheck immediately before dispatch: the accept-time claim
+    // can be released by frame evidence while this worker was hashing.
+    bool lane_ok = true;
+    {
+        std::lock_guard<std::mutex> lk(g_submit_mu);
+        auto it = g_print_lanes.find(sc.device_id);
+        if (it == g_print_lanes.end())
+            g_print_lanes[sc.device_id] = LaneEntry{key, false};
+        else if (it->second.key != key)
+            lane_ok = false;
+    }
+    if (!lane_ok) {
+        fail_pre("busy", true, "print lane taken by another submission");
+        return;
+    }
+
+    BBL::PrintParams p{};
+    if (!build_print_params(sc, a, &p, &err)) {
+        fail_pre("invalid_mapping", false, err.c_str());
+        return;
+    }
+
+    // Dispatch boundary: durably record uncertainty BEFORE the SDK call;
+    // after this point nothing may retransmit this key (contract rule 4).
+    json::Object mark;
+    mark["state"]    = json::Value("working");
+    mark["dispatch"] = json::Value("may_have_been_sent");
+    if (!receipt_update(store.get(), key, std::move(mark), "dispatch marker")) {
+        release_lane(); // fail closed: no dispatch without a durable marker
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_submit_mu);
+        auto it = g_print_lanes.find(sc.device_id);
+        if (it != g_print_lanes.end() && it->second.key == key)
+            it->second.dispatched = true;
+        else
+            g_print_lanes[sc.device_id] = LaneEntry{key, true};
+    }
+
+    const int rc = run_print_job(a, p);
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        json::Object patch;
+        patch["state"]    = json::Value("succeeded");
+        patch["dispatch"] = json::Value("confirmed");
+        receipt_update(store.get(), key, std::move(patch), "dispatch confirmed");
+        // Lane stays: the physical job owns the device until ingest_frame
+        // sees terminal/jobless evidence.
+    } else {
+        // The SDK reported failure but cannot prove the boundary was not
+        // crossed: retain uncertainty (never retransmit) and keep the
+        // lane until frame evidence releases it.
+        json::Object errv;
+        errv["code"]      = json::Value("result_unknown");
+        errv["retryable"] = json::Value(true);
+        json::Object patch;
+        patch["state"] = json::Value("unknown");
+        patch["err"]   = json::Value(std::move(errv));
+        receipt_update(store.get(), key, std::move(patch), "dispatch failed");
+    }
+}
+
+// Control worker (pause/resume/stop): same boundary discipline as the
+// print worker, minus the lane (controls never own the device).
+void worker_control(std::string key, SubmitCommand sc, std::string epoch)
+{
+    std::string err;
+    auto store = open_store(&err);
+    if (!store) {
+        OBN_WARN("queue: control worker cannot open receipt store key=%s: %s",
+                 key.c_str(), err.c_str());
+        return;
+    }
+    json::Object rec;
+    if (!store->get(key, &rec, &err)) {
+        OBN_WARN("queue: control worker receipt missing key=%s: %s",
+                 key.c_str(), err.c_str());
+        return;
+    }
+
+    auto fail_pre = [&](const char* code, bool retryable, const char* what) {
+        json::Object errv;
+        errv["code"]      = json::Value(code);
+        errv["retryable"] = json::Value(retryable);
+        json::Object patch;
+        patch["state"]    = json::Value("failed");
+        patch["dispatch"] = json::Value("not_sent");
+        patch["err"]      = json::Value(std::move(errv));
+        receipt_update(store.get(), key, std::move(patch), what);
+    };
+    auto cancel_pre = [&](const char* what) {
+        json::Object patch;
+        patch["state"]    = json::Value("cancelled");
+        patch["dispatch"] = json::Value("not_sent");
+        receipt_update(store.get(), key, std::move(patch), what);
+    };
+
+    if (current_epoch() != epoch) {
+        cancel_pre("session replaced before dispatch");
+        return;
+    }
+    // Controls recheck expected_job_id at dispatch (contract): the job
+    // may have failed/cancelled between acceptance and send.
+    if (!binds_job(store.get(), sc.device_id, sc.expected_job_id)) {
+        fail_pre("job_mismatch", false, "expected_job_id no longer binds a live job");
+        return;
+    }
+    Agent* a = Agent::active_instance();
+    if (!a || !a->user_session_snapshot().logged_in() || current_epoch() != epoch) {
+        cancel_pre("session replaced before dispatch");
+        return;
+    }
+
+    json::Object mark;
+    mark["state"]    = json::Value("working");
+    mark["dispatch"] = json::Value("may_have_been_sent");
+    if (!receipt_update(store.get(), key, std::move(mark), "dispatch marker")) return;
+
+    obn::json::Object po;
+    po["sequence_id"] = obn::seq_json_value(obn::next_mqtt_seq_id());
+    po["command"]     = json::Value(sc.kind);
+    po["param"]       = json::Value("");
+    obn::json::Object root;
+    root["print"] = obn::json::Value(std::move(po));
+    const int rc = a->send_message(sc.device_id,
+                                   obn::json::Value(std::move(root)).dump(),
+                                   /*qos=*/0);
+    if (rc == BAMBU_NETWORK_SUCCESS) {
+        json::Object patch;
+        patch["state"]    = json::Value("succeeded");
+        patch["dispatch"] = json::Value("confirmed");
+        receipt_update(store.get(), key, std::move(patch), "control published");
+    } else {
+        // A QoS 0 publish can fail after the frame left: retain
+        // uncertainty, never auto-retry a control.
+        json::Object errv;
+        errv["code"]      = json::Value("result_unknown");
+        errv["retryable"] = json::Value(true);
+        json::Object patch;
+        patch["state"] = json::Value("unknown");
+        patch["err"]   = json::Value(std::move(errv));
+        receipt_update(store.get(), key, std::move(patch), "control publish failed");
+    }
+}
+
+std::string op_command_submit(const json::Object& root, Meta& m)
+{
+    std::string client_id;
+    if (const std::string gate = gate_client_fields(
+            root, m, {"api", "request_id", "op", "client_id", "session_epoch", "params"},
+            &client_id);
+        !gate.empty())
+        return gate;
+
+    std::string err;
+    const json::Value& params = gv(root, "params");
+    if (!params.is_object())
+        return error_env(m, "invalid_request", "params must be an object", false);
+    if (!exact_keys(params.as_object(), {"submission_scope", "idempotency_key", "command"}, err))
+        return error_env(m, "invalid_request", err, false);
+
+    const json::Value& scope_v = gv(params.as_object(), "submission_scope");
+    if (!bounded_string(scope_v, 1, 128))
+        return error_env(m, "invalid_request",
+                         "submission_scope must be a string of 1..128 bytes", false);
+    const std::string scope = scope_v.as_string();
+
+    const json::Value& key_v = gv(params.as_object(), "idempotency_key");
+    if (!valid_idem_key(key_v))
+        return error_env(m, "invalid_request",
+                         "idempotency_key must be 16..128 chars of [A-Za-z0-9._:-]",
+                         false);
+    const std::string key = key_v.as_string();
+
+    SubmitCommand sc;
+    const char*    pcode = "invalid_request";
+    if (!parse_command(gv(params.as_object(), "command"), &sc, &err, &pcode))
+        return error_env(m, pcode, err, false);
+
+    const std::string fp = command_fingerprint(sc.command);
+
+    // Client lease + device existence (registry lock, released before
+    // any store I/O).
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto  now  = Clock::now();
+        std::string cerr;
+        Client* c = find_client_locked(r, client_id, now, &cerr);
+        if (!c) return error_env(m, "client_expired", cerr, false);
+        c->deadline = now + std::chrono::seconds(c->lease_seconds);
+        if (!known_device_locked(r, sc.device_id))
+            return error_env(m, "invalid_request",
+                             "unknown device_id: " + sc.device_id, false);
+    }
+
+    std::string serr;
+    auto store = open_store(&serr);
+    if (!store)
+        return error_env(m, serr.c_str(),
+                         serr == "signed_out"
+                             ? "no authorized session for command submission"
+                             : "receipt store unavailable; no actions accepted",
+                         true);
+    if (scope != store->scope())
+        return error_env(m, "submission_scope_changed",
+                         "submission_scope does not match the current store scope",
+                         false);
+
+    // Dedup first (contract): an existing key answers before the
+    // printer-busy check and before any occupied-lane rejection.
+    {
+        json::Object rec;
+        std::string  gerr;
+        if (store->get(key, &rec, &gerr)) {
+            auto fpit = rec.find("fp");
+            const std::string stored =
+                (fpit != rec.end() && fpit->second.is_string())
+                    ? fpit->second.as_string() : std::string();
+            if (stored != fp)
+                return error_env(m, "idempotency_conflict",
+                                 "idempotency_key reused with a different command payload",
+                                 false);
+            std::lock_guard<std::mutex> sub(g_submit_mu);
+            if (sc.kind == "print" &&
+                g_print_lanes.find(sc.device_id) == g_print_lanes.end())
+                g_print_lanes[sc.device_id] = LaneEntry{key, false};
+            return success_env(m, receipt_result(scope, rec));
+        }
+        if (gerr != "not_found")
+            return error_env(m, "submission_store_unavailable",
+                             "receipt store unavailable; no actions accepted", true);
+    }
+
+    // New key: a busy printer is rejected before reserving anything.
+    if (sc.kind == "print") {
+        const DeviceSnap snap = snapshot_device(sc.device_id);
+        if (snap.have_frame && snap.busy)
+            return error_env(m, "busy", "printer is busy with another job", true);
+    }
+
+    std::lock_guard<std::mutex> sub(g_submit_mu);
+
+    // Re-check under the submit lock: another thread or process may
+    // have reserved the same key while we were checking the printer.
+    json::Object rec;
+    std::string  gerr;
+    if (store->get(key, &rec, &gerr)) {
+        auto fpit = rec.find("fp");
+        const std::string stored =
+            (fpit != rec.end() && fpit->second.is_string())
+                ? fpit->second.as_string() : std::string();
+        if (stored != fp)
+            return error_env(m, "idempotency_conflict",
+                             "idempotency_key reused with a different command payload",
+                             false);
+        if (sc.kind == "print" &&
+            g_print_lanes.find(sc.device_id) == g_print_lanes.end())
+            g_print_lanes[sc.device_id] = LaneEntry{key, false};
+        return success_env(m, receipt_result(scope, rec));
+    }
+    if (gerr != "not_found")
+        return error_env(m, "submission_store_unavailable",
+                         "receipt store unavailable; no actions accepted", true);
+
+    if (sc.kind == "print") {
+        const auto lane = g_print_lanes.find(sc.device_id);
+        if (lane != g_print_lanes.end() && lane->second.key != key)
+            return error_env(m, "busy", "printer already has a queued print", true);
+    } else if (!binds_job(store.get(), sc.device_id, sc.expected_job_id)) {
+        return error_env(m, "job_mismatch",
+                         "expected_job_id does not match an active queued job", false);
+    }
+
+    json::Object extra;
+    extra["dev"]  = json::Value(sc.device_id);
+    extra["kind"] = json::Value(sc.kind);
+    if (sc.kind != "print")
+        extra["jid"] = json::Value(sc.expected_job_id);
+    else
+        extra["tag"] = json::Value(sc.task_tag);
+
+    const ReceiptStore::Reservation rsv = store->reserve(key, fp, &extra);
+    if (!rsv.ok) {
+        if (rsv.error == "idempotency_conflict")
+            return error_env(m, "idempotency_conflict",
+                             "idempotency_key reused with a different command payload",
+                             false);
+        if (rsv.error == "capacity_exceeded")
+            return error_env(m, "capacity_exceeded", "receipt store is full", false);
+        if (rsv.error == "invalid_argument")
+            return error_env(m, "invalid_request",
+                             "invalid idempotency key or fingerprint", false);
+        return error_env(m, "submission_store_unavailable",
+                         "receipt store unavailable; no actions accepted", true);
+    }
+    if (rsv.replay) {
+        // Raced with another submit for the same key: return the
+        // original identity; dispatch stays with the original owner.
+        json::Object rrec;
+        if (!store->get(key, &rrec, &gerr))
+            return error_env(m, "submission_store_unavailable",
+                             "receipt store unavailable; no actions accepted", true);
+        if (sc.kind == "print" &&
+            g_print_lanes.find(sc.device_id) == g_print_lanes.end())
+            g_print_lanes[sc.device_id] = LaneEntry{key, false};
+        return success_env(m, receipt_result(scope, rrec));
+    }
+    if (sc.kind == "print") g_print_lanes[sc.device_id] = LaneEntry{key, false};
+
+    const std::string epoch = m.epoch;
+    if (dispatch_enabled()) {
+        if (sc.kind == "print")
+            std::thread(worker_print, key, sc, epoch).detach();
+        else
+            std::thread(worker_control, key, sc, epoch).detach();
+    }
+
+    json::Object frec;
+    if (!store->get(key, &frec, &gerr))
+        return error_env(m, "submission_store_unavailable",
+                         "receipt store unavailable; no actions accepted", true);
+    return success_env(m, receipt_result(scope, frec));
+}
+
+std::string op_command_get(const json::Object& root, Meta& m)
+{
+    std::string client_id;
+    if (const std::string gate = gate_client_fields(
+            root, m, {"api", "request_id", "op", "client_id", "session_epoch", "params"},
+            &client_id);
+        !gate.empty())
+        return gate;
+
+    std::string err;
+    const json::Value& params = gv(root, "params");
+    if (!params.is_object())
+        return error_env(m, "invalid_request", "params must be an object", false);
+    if (!exact_keys(params.as_object(), {"submission_scope", "idempotency_key"}, err))
+        return error_env(m, "invalid_request", err, false);
+
+    const json::Value& scope_v = gv(params.as_object(), "submission_scope");
+    if (!bounded_string(scope_v, 1, 128))
+        return error_env(m, "invalid_request",
+                         "submission_scope must be a string of 1..128 bytes", false);
+    const std::string scope = scope_v.as_string();
+    const json::Value& key_v = gv(params.as_object(), "idempotency_key");
+    if (!valid_idem_key(key_v))
+        return error_env(m, "invalid_request",
+                         "idempotency_key must be 16..128 chars of [A-Za-z0-9._:-]",
+                         false);
+    const std::string key = key_v.as_string();
+
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto  now  = Clock::now();
+        std::string cerr;
+        Client* c = find_client_locked(r, client_id, now, &cerr);
+        if (!c) return error_env(m, "client_expired", cerr, false);
+        c->deadline = now + std::chrono::seconds(c->lease_seconds);
+    }
+
+    std::string serr;
+    auto store = open_store(&serr);
+    if (!store)
+        return error_env(m, serr.c_str(),
+                         serr == "signed_out"
+                             ? "no authorized session for receipt lookup"
+                             : "receipt store unavailable",
+                         true);
+    if (scope != store->scope())
+        return error_env(m, "submission_scope_changed",
+                         "submission_scope does not match the current store scope",
+                         false);
+
+    json::Object rec;
+    std::string  gerr;
+    if (!store->get(key, &rec, &gerr)) {
+        if (gerr == "not_found")
+            return error_env(m, "not_found",
+                             "no receipt for this idempotency key", false);
+        return error_env(m, "submission_store_unavailable",
+                         "receipt store unavailable", true);
+    }
+    return success_env(m, receipt_result(scope, rec));
+}
+
+std::string op_job_get(const json::Object& root, Meta& m)
+{
+    std::string client_id;
+    if (const std::string gate = gate_client_fields(
+            root, m, {"api", "request_id", "op", "client_id", "session_epoch", "params"},
+            &client_id);
+        !gate.empty())
+        return gate;
+
+    std::string err;
+    const json::Value& params = gv(root, "params");
+    if (!params.is_object())
+        return error_env(m, "invalid_request", "params must be an object", false);
+    if (!exact_keys(params.as_object(), {"submission_scope", "device_id", "job_id"}, err))
+        return error_env(m, "invalid_request", err, false);
+
+    const json::Value& scope_v = gv(params.as_object(), "submission_scope");
+    if (!bounded_string(scope_v, 1, 128))
+        return error_env(m, "invalid_request",
+                         "submission_scope must be a string of 1..128 bytes", false);
+    const std::string scope = scope_v.as_string();
+    const json::Value& dev_v = gv(params.as_object(), "device_id");
+    if (!valid_device_id(dev_v))
+        return error_env(m, "invalid_request",
+                         "device_id must be a string of 1..128 bytes", false);
+    const std::string device_id = dev_v.as_string();
+    const json::Value& job_v = gv(params.as_object(), "job_id");
+    if (!bounded_string(job_v, 1, 128))
+        return error_env(m, "invalid_request",
+                         "job_id must be a string of 1..128 bytes", false);
+    const std::string job_id = job_v.as_string();
+
+    {
+        Registry& r = reg();
+        std::lock_guard<std::mutex> lk(r.mu);
+        const auto  now  = Clock::now();
+        std::string cerr;
+        Client* c = find_client_locked(r, client_id, now, &cerr);
+        if (!c) return error_env(m, "client_expired", cerr, false);
+        c->deadline = now + std::chrono::seconds(c->lease_seconds);
+    }
+
+    std::string serr;
+    auto store = open_store(&serr);
+    if (!store)
+        return error_env(m, serr.c_str(),
+                         serr == "signed_out"
+                             ? "no authorized session for job lookup"
+                             : "receipt store unavailable",
+                         true);
+    if (scope != store->scope())
+        return error_env(m, "submission_scope_changed",
+                         "submission_scope does not match the current store scope",
+                         false);
+
+    json::Object rec;
+    std::string  gerr;
+    const bool found = store->find_if(
+        [&](const json::Object& o) {
+            return rec_str(o, "kind") == "print" &&
+                   rec_str(o, "dev") == device_id &&
+                   rec_str(o, "jid") == job_id;
+        },
+        &rec, &gerr);
+    if (!found) {
+        if (gerr == "not_found")
+            return error_env(m, "not_found",
+                             "no job for this device_id/job_id", false);
+        return error_env(m, "submission_store_unavailable",
+                         "receipt store unavailable", true);
+    }
+    return success_env(m, job_result(scope, rec, snapshot_device(device_id)));
+}
+
 std::string dispatch(const json::Object& root)
 {
     Meta m;
@@ -1283,6 +2622,9 @@ std::string dispatch(const json::Object& root)
     if (m.op == "watch.set")     return op_watch_set(root, m);
     if (m.op == "snapshot.get")  return op_snapshot_get(root, m);
     if (m.op == "events.poll")   return op_events_poll(root, m);
+    if (m.op == "command.submit") return op_command_submit(root, m);
+    if (m.op == "command.get")    return op_command_get(root, m);
+    if (m.op == "job.get")        return op_job_get(root, m);
     return error_env(m, "not_supported", "unknown op: " + m.op, false);
 }
 
@@ -1350,6 +2692,30 @@ void free_v1(char* response_utf8)
 {
     std::free(response_utf8);
 }
+
+#ifdef OBN_TESTING
+void test_set_command_session(const std::string& user_id,
+                              const std::string& config_dir)
+{
+    g_test_session       = auth::Session{};
+    g_test_session.user_id      = user_id;
+    g_test_session.access_token = "test-token"; // logged_in() checks both
+    g_test_config_dir   = config_dir;
+    g_test_session_set  = true;
+}
+
+void test_clear_command_session()
+{
+    g_test_session      = auth::Session{};
+    g_test_config_dir.clear();
+    g_test_session_set = false;
+}
+
+void test_set_dispatch_enabled(bool enabled)
+{
+    g_test_dispatch_on = enabled;
+}
+#endif
 
 } // namespace obn::queue
 

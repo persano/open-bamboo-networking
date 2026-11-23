@@ -181,14 +181,20 @@ static void test_capabilities()
     CHECK(e.v.find("api").as_number() == 1.0);
     CHECK(!e.v.find("instance_id").as_string().empty());
     CHECK(!e.v.find("session_epoch").as_string().empty());
-    CHECK(e.v.find("capabilities_revision").as_string() == "c1");
+    CHECK(e.v.find("capabilities_revision").as_string() == "stage3-draft-1");
     CHECK(e.v.find("op").as_string() == "capabilities");
 
     const json::Value res = e.v.find("result");
     CHECK(res.find("api_versions").as_array().size() == 1);
     CHECK(res.find("api_versions").as_array()[0].as_number() == 1.0);
-    CHECK(res.find("operations").as_array().size() == 7);
-    CHECK(res.find("command_kinds").as_array().empty());
+    CHECK(res.find("operations").as_array().size() == 10);
+    CHECK(res.find("command_kinds").as_array().size() == 4);
+    CHECK(res.find("command_kinds").as_array()[0].as_string() == "print");
+    CHECK(res.find("command_kinds").as_array()[3].as_string() == "stop");
+    CHECK(res.find("command_protocol_revision").as_string() == "stage3-draft-1");
+    const json::Value sub = res.find("submission");
+    CHECK(sub.find("idempotency").as_string() == "durable_at_most_once_dispatch");
+    CHECK(sub.find("max_pending_per_device").as_number() == 1.0);
     CHECK(res.find("features").as_array().size() == 2);
     CHECK(res.find("limits.max_clients").as_number() == 4);
     CHECK(res.find("limits.poll_min_interval_ms").as_number() == 500);
@@ -527,6 +533,264 @@ static void test_read_text_file()
     fs::remove(p, ec);
 }
 
+// ---------------------------------------------------------------------------
+// Stage-3 command.submit / command.get / job.get (issue #16): validation,
+// signed-out fail-closed, durable dedup/replay/conflict, lane serialization,
+// job binding, and worker pre-dispatch file failures.
+// ---------------------------------------------------------------------------
+#include <chrono>
+#include <thread>
+
+static std::string print_cmd(const std::string& dev, const std::string& path,
+                             const std::string& sha, const char* tag = "t-queue-test")
+{
+    return "{\"kind\":\"print\",\"device_id\":\"" + dev + "\",\"payload\":{"
+           "\"file\":{\"path\":\"" + path + "\",\"sha256\":\"" + sha +
+           "\",\"plate_index\":1},"
+           "\"task_tag\":\"" + std::string(tag) + "\",\"supply\":\"external\","
+           "\"materials\":[{\"source_filament_id\":\"0\",\"slot_id\":\"external\","
+           "\"type\":\"PLA\",\"profile_id\":\"p0\","
+           "\"source_color\":\"#FF0000\",\"target_color\":\"#FF0000\"}],"
+           "\"options\":{\"bed_leveling\":false,\"flow_calibration\":false,"
+           "\"timelapse\":false}}}";
+}
+
+// Poll command.get until the receipt leaves "accepted" (worker threads run
+// detached); returns the last observed state, "" on timeout.
+static std::string wait_receipt_state(const std::string& key,
+                                      const std::string& scope, int max_ms)
+{
+    std::string last;
+    for (int waited = 0; waited < max_ms; waited += 25) {
+        Envelope e = call(client_op(
+            "command.get",
+            ",\"params\":{\"submission_scope\":\"" + scope +
+                "\",\"idempotency_key\":\"" + key + "\"}"));
+        if (ok(e)) {
+            last = e.v.find("result.state").as_string();
+            if (last != "accepted") return last;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return last;
+}
+
+static void test_commands()
+{
+    namespace fs = std::filesystem;
+    const fs::path cdir = fs::temp_directory_path() / "obn_queue_cmd_test";
+    std::error_code ec;
+    fs::remove_all(cdir, ec);
+    fs::create_directories(cdir, ec);
+
+    // Live client (the purge test closed the previous one).
+    Envelope e = call(req("client.open",
+                          ",\"params\":{\"name\":\"q3\",\"lease_seconds\":60}", "q1"));
+    CHECK(ok(e));
+    g_client = e.v.find("result.client_id").as_string();
+    g_epoch  = e.v.find("session_epoch").as_string();
+    CHECK(!g_client.empty());
+
+    obn::queue::note_devices_from_cloud(
+        "{\"devices\":[{\"dev_id\":\"" + std::string(kDev) +
+        "\",\"dev_name\":\"P1S\",\"dev_product_name\":\"Bambu Lab P1S\"},"
+        "{\"dev_id\":\"01P00C490800260\",\"dev_name\":\"P1S-2\","
+        "\"dev_product_name\":\"Bambu Lab P1S\"}]}");
+
+    // Deterministic busy state for the accept-path checks below.
+    obn::queue::ingest_frame(kDev,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,\"gcode_state\":\"RUNNING\"}}");
+
+    const std::string kDev2 = "01P00C490800260";
+    const std::string sha0(64, '0');
+    const std::string key1 = "stage3-key-00000001";
+    const std::string key2 = "stage3-key-00000002";
+    const std::string key4 = "stage3-key-00000004";
+    const std::string key5 = "stage3-key-00000005";
+    const std::string key6 = "stage3-key-00000006";
+
+    auto submit = [&](const std::string& params) {
+        return call(client_op("command.submit", ",\"params\":" + params));
+    };
+
+    // --- Request validation (no store needed). ---
+    e = submit("{\"submission_scope\":\"s\",\"command\":{}}");
+    CHECK(err_code(e) == "invalid_request"); // missing idempotency_key
+    e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"short\","
+               "\"command\":{}}");
+    CHECK(err_code(e) == "invalid_request"); // key < 16 chars
+    e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
+               "\",\"command\":{\"kind\":\"skip_objects\",\"device_id\":\"" +
+               kDev + "\"}}");
+    CHECK(err_code(e) == "not_supported");
+    {
+        // supply "none" is parsed but not advertised.
+        std::string cmd = print_cmd(kDev, "C:/none.gcode", sha0);
+        const auto pos  = cmd.find("\"supply\":\"external\"");
+        cmd.replace(pos, 19, "\"supply\":\"none\"");
+        e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
+                   "\",\"command\":" + cmd + "}");
+        CHECK(err_code(e) == "not_supported");
+    }
+    e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
+               "\",\"command\":" + print_cmd("ghost-dev", "C:/none.gcode", sha0) + "}");
+    CHECK(err_code(e) == "invalid_request"); // unknown device
+
+    // --- Signed out: submission scope is null, submit fails closed. ---
+    e = call(req("capabilities", "", "q2"));
+    CHECK(ok(e));
+    CHECK(e.v.find("result.submission.scope").is_null());
+    e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
+               "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(err_code(e) == "signed_out");
+    CHECK(e.v.find("error.retryable").as_bool() == true);
+
+    // --- Session injected, dispatch suppressed for accept-path checks. ---
+    obn::queue::test_set_command_session("u_queue_test", cdir.string());
+    obn::queue::test_set_dispatch_enabled(false);
+
+    e = call(req("capabilities", "", "q3"));
+    CHECK(ok(e));
+    const std::string scope = e.v.find("result.submission.scope").as_string();
+    CHECK(!scope.empty());
+
+    // Busy printer (RUNNING frame above) rejected before reserving.
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key1 + "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(err_code(e) == "busy");
+    CHECK(e.v.find("error.retryable").as_bool() == true);
+
+    // Wrong scope.
+    e = submit("{\"submission_scope\":\"wrong-scope-1\",\"idempotency_key\":\"" +
+               key1 + "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(err_code(e) == "submission_scope_changed");
+
+    // IDLE now: first acceptance.
+    obn::queue::ingest_frame(kDev,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,\"gcode_state\":\"IDLE\"}}");
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key1 + "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(ok(e));
+    const std::string cid = e.v.find("result.command_id").as_string();
+    const std::string jid = e.v.find("result.job_id").as_string();
+    CHECK(!cid.empty());
+    CHECK(jid.rfind("job-", 0) == 0);
+    CHECK(e.v.find("result.state").as_string() == "accepted");
+    CHECK(e.v.find("result.dispatch").as_string() == "not_sent");
+    CHECK(e.v.find("result.kind").as_string() == "print");
+    CHECK(e.v.find("result.device_id").as_string() == kDev);
+    CHECK(!e.v.find("result.accepted_at").as_string().empty());
+    CHECK(e.v.find("result.accepted_at").as_string() ==
+          e.v.find("result.updated_at").as_string());
+    CHECK(e.v.find("result.error").is_null());
+
+    // Replay: identical payload returns the original identity.
+    Envelope r = submit("{\"submission_scope\":\"" + scope +
+                        "\",\"idempotency_key\":\"" + key1 +
+                        "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(ok(r));
+    CHECK(r.v.find("result.command_id").as_string() == cid);
+    CHECK(r.v.find("result.job_id").as_string() == jid);
+
+    // Same key, different payload -> conflict, no new receipt.
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key1 + "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0, "other-tag") + "}");
+    CHECK(err_code(e) == "idempotency_conflict");
+
+    // Lane held by key1: a second print for the same device is busy.
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key2 + "\",\"command\":" + print_cmd(kDev, "C:/none.gcode", sha0) + "}");
+    CHECK(err_code(e) == "busy");
+
+    // command.get: the receipt, an unknown key, and a wrong scope.
+    e = call(client_op("command.get",
+                       ",\"params\":{\"submission_scope\":\"" + scope +
+                           "\",\"idempotency_key\":\"" + key1 + "\"}"));
+    CHECK(ok(e));
+    CHECK(e.v.find("result.command_id").as_string() == cid);
+    CHECK(e.v.find("result.state").as_string() == "accepted");
+    e = call(client_op("command.get",
+                       ",\"params\":{\"submission_scope\":\"" + scope +
+                           "\",\"idempotency_key\":\"stage3-key-99999999\"}"));
+    CHECK(err_code(e) == "not_found");
+    e = call(client_op("command.get",
+                       ",\"params\":{\"submission_scope\":\"nope-scope-x\","
+                       "\"idempotency_key\":\"" + key1 + "\"}"));
+    CHECK(err_code(e) == "submission_scope_changed");
+
+    // job.get binds the print receipt through its job id.
+    e = call(client_op("job.get",
+                       ",\"params\":{\"submission_scope\":\"" + scope +
+                           "\",\"device_id\":\"" + kDev +
+                           "\",\"job_id\":\"" + jid + "\"}"));
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.job_id").as_string() == jid);
+    CHECK(e.v.find("result.job.state").as_string() == "pending");
+    CHECK(e.v.find("result.job.terminal").is_null());
+    e = call(client_op("job.get",
+                       ",\"params\":{\"submission_scope\":\"" + scope +
+                           "\",\"device_id\":\"" + kDev +
+                           "\",\"job_id\":\"job-nonexistent\"}"));
+    CHECK(err_code(e) == "not_found");
+
+    // Controls bind expected_job_id to the live print receipt.
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               "stage3-key-00000003\",\"command\":{\"kind\":\"pause\","
+               "\"device_id\":\"" + kDev + "\",\"expected_job_id\":\"" + jid + "\"}}");
+    CHECK(ok(e));
+    CHECK(e.v.find("result.kind").as_string() == "pause");
+    CHECK(e.v.find("result.state").as_string() == "accepted");
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               "stage3-key-00000007\",\"command\":{\"kind\":\"stop\","
+               "\"device_id\":\"" + kDev +
+               "\",\"expected_job_id\":\"job-nonexistent\"}}");
+    CHECK(err_code(e) == "job_mismatch");
+
+    // --- Worker pre-dispatch failures (dispatch on, detached threads). ---
+    obn::queue::test_set_dispatch_enabled(true);
+
+    // Missing file -> unsafe_file, not_sent, lane released.
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key4 + "\",\"command\":" + print_cmd(kDev2, "C:/obn-no-such/no.gcode", sha0) + "}");
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(key4, scope, 5000) == "failed");
+    e = call(client_op("command.get",
+                       ",\"params\":{\"submission_scope\":\"" + scope +
+                           "\",\"idempotency_key\":\"" + key4 + "\"}"));
+    CHECK(e.v.find("result.dispatch").as_string() == "not_sent");
+    CHECK(e.v.find("result.error.code").as_string() == "unsafe_file");
+    CHECK(e.v.find("result.error.retryable").as_bool() == false);
+
+    // Existing file, wrong hash -> file_changed, lane released.
+    {
+        std::string fpath = (cdir / "payload.gcode").string();
+        for (char& c : fpath)
+            if (c == '\\') c = '/';
+        {
+            std::ofstream f(cdir / "payload.gcode", std::ios::binary | std::ios::trunc);
+            f << "gcode content";
+        }
+        e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+                   key5 + "\",\"command\":" + print_cmd(kDev2, fpath, sha0) + "}");
+        CHECK(ok(e));
+        CHECK(wait_receipt_state(key5, scope, 5000) == "failed");
+        e = call(client_op("command.get",
+                           ",\"params\":{\"submission_scope\":\"" + scope +
+                               "\",\"idempotency_key\":\"" + key5 + "\"}"));
+        CHECK(e.v.find("result.error.code").as_string() == "file_changed");
+    }
+
+    // Both worker failures released the kDev2 lane: a fresh key accepts.
+    obn::queue::test_set_dispatch_enabled(false);
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               key6 + "\",\"command\":" + print_cmd(kDev2, "C:/none.gcode", sha0) + "}");
+    CHECK(ok(e));
+
+    obn::queue::test_clear_command_session();
+    obn::queue::test_set_dispatch_enabled(true);
+    fs::remove_all(cdir, ec);
+}
+
 int main()
 {
     test_validation();
@@ -536,6 +800,7 @@ int main()
     test_events_poll();
     test_session_purge();
     test_read_text_file();
+    test_commands();
 
     if (fail_count) {
         std::fprintf(stderr, "%d check(s) failed\n", fail_count);

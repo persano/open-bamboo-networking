@@ -3,7 +3,9 @@
 // Internal C++ interface of the versioned queue integration API
 // (obn_queue_api_v1.h is the public C contract; this is its engine).
 // Stage 2 scope: capability discovery, read-only multi-printer snapshots
-// and polled events. Commands/print submission arrive in a later stage.
+// and polled events. Stage 3 adds the capability-gated command.submit /
+// command.get / job.get operations backed by the durable receipt store
+// (docs/queue-api-v1-stage3/).
 
 #include <cstdint>
 #include <string>
@@ -30,5 +32,17 @@ void note_devices_from_cloud(const std::string& raw_body);
 std::int32_t call_v1(const char* request_utf8, std::uint32_t request_bytes,
                      char** response_utf8, std::uint32_t* response_bytes);
 void free_v1(char* response_utf8);
+
+#ifdef OBN_TESTING
+// Test seams for the stage-3 command path (tests only; absent from
+// production builds). Inject the authorized session + config dir the
+// receipt store opens with (tests have no live Agent), and suppress
+// worker-thread dispatch so accept/replay/lane assertions stay
+// deterministic.
+void test_set_command_session(const std::string& user_id,
+                              const std::string& config_dir);
+void test_clear_command_session();
+void test_set_dispatch_enabled(bool enabled);
+#endif
 
 } // namespace obn::queue

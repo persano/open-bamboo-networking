@@ -430,7 +430,8 @@ void ReceiptStore::maybe_compact_locked()
 // ---------------------------------------------------------------------------
 
 ReceiptStore::Reservation ReceiptStore::reserve(const std::string& idempotency_key,
-                                                const std::string& fingerprint)
+                                                const std::string& fingerprint,
+                                                const json::Object* extra)
 {
     Reservation r;
     if (!valid_key(idempotency_key) || fingerprint.empty() ||
@@ -484,9 +485,20 @@ ReceiptStore::Reservation ReceiptStore::reserve(const std::string& idempotency_k
     obj["k"]        = idempotency_key;
     obj["fp"]       = fingerprint;
     obj["cid"]      = next_command_id_locked();
+    // Job ID shares the command counter so receipt + command + job
+    // identity land on one durable line (stage-3 contract rule 3).
+    obj["jid"]      = "job-" + obj["cid"].as_string().substr(std::strlen("command-"));
     obj["state"]    = "accepted";
     obj["dispatch"] = "not_sent";
-    obj["ts"]       = utc_stamp();
+    const std::string stamp = utc_stamp();
+    obj["ts"]       = stamp;
+    obj["acc"]      = stamp; // accepted_at; preserved by later updates
+    if (extra) {
+        for (const auto& kv : *extra) {
+            if (kv.first == "k" || kv.first == "fp" || kv.first == "cid") continue;
+            obj[kv.first] = kv.second;
+        }
+    }
     const std::string line = json::Value(obj).dump() + "\n";
 
     std::string err;
@@ -526,6 +538,31 @@ bool ReceiptStore::get(const std::string& idempotency_key, json::Object* out,
     return true;
 }
 
+bool ReceiptStore::find_if(const std::function<bool(const json::Object&)>& pred,
+                           json::Object* out, std::string* error)
+{
+    if (!out || !pred) {
+        if (error) *error = "invalid_argument";
+        return false;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    const fs::path lock_path = fs::path(dir_) / kLockName;
+    FileLock lock(lock_path);
+    if (!lock.held()) {
+        if (error) *error = "submission_store_unavailable";
+        return false;
+    }
+    reload_locked();
+    for (const auto& kv : cache_) {
+        if (pred(kv.second)) {
+            *out = kv.second;
+            return true;
+        }
+    }
+    if (error) *error = "not_found";
+    return false;
+}
+
 bool ReceiptStore::update(const std::string& idempotency_key,
                           const json::Object& patch, std::string* error)
 {
@@ -562,6 +599,11 @@ bool ReceiptStore::update(const std::string& idempotency_key,
             continue;
         }
         merged[kv.first] = kv.second;
+    }
+    if (merged.find("acc") == merged.end()) {
+        // accepted_at: keep the reservation's timestamp across updates.
+        auto old = it->second.find("ts");
+        if (old != it->second.end()) merged["acc"] = old->second;
     }
     merged["ts"] = utc_stamp(); // native observation time of this transition
     const std::string line = json::Value(merged).dump() + "\n";

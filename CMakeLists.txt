@@ -1053,6 +1053,7 @@ if(OBN_BUILD_TESTS)
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
         src/queue_api.cpp
+        src/receipt_store.cpp
         src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
@@ -1269,6 +1270,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
         src/queue_api.cpp
+        src/receipt_store.cpp
         src/state.cpp
         src/signing.cpp
         src/ssdp.cpp
