@@ -34,6 +34,7 @@
 #include "obn/json_lite.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -71,12 +72,18 @@ public:
     // existing key with the same fingerprint returns the original
     // identity (replay=true); a different fingerprint fails with
     // idempotency_conflict; a new key appends its durable reservation
-    // (receipt + command id, flushed to stable storage) before returning.
+    // (receipt + command id + job id, flushed to stable storage) before
+    // returning. `extra`, when given, is merged into that one
+    // reservation line (identity fields k/fp/cid are ignored there), so
+    // caller-owned receipt fields such as device/kind land atomically
+    // with the reservation. The store also stamps acc (accepted_at)
+    // with the reservation time on the first line.
     // If the flush fails the reservation may still exist on disk: the
     // error is not proof of rejection, and retrying the identical key is
     // the recovery path (replay or a fresh reservation).
     Reservation reserve(const std::string& idempotency_key,
-                        const std::string& fingerprint);
+                        const std::string& fingerprint,
+                        const json::Object* extra = nullptr);
 
     // Current receipt for the key (last line wins), copied into *out.
     // Fails with not_found for an unknown key or invalid_argument for a
@@ -84,6 +91,16 @@ public:
     // served. Read-only observation never reserves or changes anything.
     bool get(const std::string& idempotency_key, json::Object* out,
              std::string* error = nullptr);
+
+    // Scans every retained receipt (last line per key) until pred
+    // returns true; the match is copied into *out. Fails with not_found
+    // when nothing matches, invalid_argument for a bad predicate, or
+    // submission_store_unavailable when the lock cannot be taken.
+    // Read-only like get(): never reserves or changes anything. Used by
+    // job.get / control binding where the lookup key is (device, job id)
+    // rather than the idempotency key.
+    bool find_if(const std::function<bool(const json::Object&)>& pred,
+                 json::Object* out, std::string* error = nullptr);
 
     // Appends a full snapshot line for an existing key: patch fields are
     // merged over the current receipt (identity fields k/fp/cid must not

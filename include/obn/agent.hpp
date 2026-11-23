@@ -431,6 +431,10 @@ public:
     // Last LAN access code seen in connect_printer for this dev_id (needed
     // because bambu_network_bind does not pass the code in the ABI).
     std::string lan_access_code_for(const std::string& dev_id) const;
+    // Last LAN IP seen for this dev_id (SSDP or push_status); "" when the
+    // printer has never answered on the local network. Pairs with
+    // lan_access_code_for for callers that must fill PrintParams::dev_ip.
+    std::string lan_ip_for(const std::string& dev_id) const;
     // Remember the LAN access code learned outside connect_printer (the
     // cloud /user/print endpoint returns it as dev_access_code). Lets
     // camera_url_for() mint LAN URLs in cloud-only sessions where no LAN
