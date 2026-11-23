@@ -90,12 +90,25 @@ jobs:
 
       - name: Configure
         run: |
-          ./configure \
-            --build-type=Release \
-            --enable-tests \
-            --with-version='${{ matrix.abi }}.99' \
-            --no-conf-patch \
-            --cmake-arg=-DOBN_RELEASE=ON
+          # Vendored curl is git-cloned by FetchContent at configure time;
+          # a transient runner network blip (issue seen2026-11-23: github.com
+          # unresolvable for ~75s) fails the whole matrix job. Retry spaced.
+          ok=0
+          for attempt in 1 2 3; do
+            if ./configure \
+              --build-type=Release \
+              --enable-tests \
+              --with-version='${{ matrix.abi }}.99' \
+              --no-conf-patch \
+              --cmake-arg=-DOBN_RELEASE=ON
+            then
+              ok=1
+              break
+            fi
+            echo "::warning::configure attempt $attempt failed, retrying"
+            sleep 20
+          done
+          [ "$ok" = 1 ]
 
       - name: Build
         run: make -j"$(nproc)"
@@ -243,12 +256,25 @@ jobs:
 
       - name: Configure
         run: |
-          ./configure \
-            --build-type=Release \
-            --enable-tests \
-            --with-version='${{ matrix.abi }}.99' \
-            --no-conf-patch \
-            --cmake-arg=-DOBN_RELEASE=ON
+          # Vendored curl is git-cloned by FetchContent at configure time;
+          # a transient runner network blip (issue seen2026-11-23: github.com
+          # unresolvable for ~75s) fails the whole matrix job. Retry spaced.
+          ok=0
+          for attempt in 1 2 3; do
+            if ./configure \
+              --build-type=Release \
+              --enable-tests \
+              --with-version='${{ matrix.abi }}.99' \
+              --no-conf-patch \
+              --cmake-arg=-DOBN_RELEASE=ON
+            then
+              ok=1
+              break
+            fi
+            echo "::warning::configure attempt $attempt failed, retrying"
+            sleep 20
+          done
+          [ "$ok" = 1 ]
 
       - name: Build
         run: make -j"$(sysctl -n hw.ncpu)"
