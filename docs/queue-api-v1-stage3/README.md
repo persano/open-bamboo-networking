@@ -1,6 +1,9 @@
 # Stage 3: asynchronous commands and correlated jobs (draft for review)
 
-**Contract and tests only. Nothing here enables commands or changes printer behavior.**
+**Contract, tests and native wiring.** `command.submit`, `command.get` and
+`job.get` are implemented on this branch behind capability gates (commit
+`9ba45b1`), advertised as `command_protocol_revision = "stage3-draft-1"`.
+Nothing changes printer behavior until a consumer submits through them.
 
 Target repository: `persano/open-bamboo-networking`, branch `option-b-cloud-rescue`.
 Reviewed base: `08f9b2fa0fbab03f51950cd0e57d91065a944900` (2026-11-21).
@@ -30,6 +33,10 @@ these additions. Check global AND per-printer command support before submitting.
 Advertise print options and supply modes separately; unsupported settings must
 fail before dispatch, never be silently ignored. Existing limits stay intact;
 new durable storage capacity is `submission.max_retained_keys`.
+`limits.max_command_receipts_per_client` stays advertised for backward
+compatibility, documented as legacy only: consumers must treat
+`submission.max_retained_keys` as the authoritative per-account limit, shared
+across clients and processes.
 
 No new DLL, listener, login, exposed credentials/tokens, or replacement host
 callback. No changes to LAN/cloud mode or AMS refill configuration.
