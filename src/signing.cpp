@@ -338,15 +338,31 @@ void encrypt_print_fields(obn::json::Object& obj, EVP_PKEY* device_pub,
 
 // Builds the command dump ({...sorted keys...}) after optional field encryption.
 // Uses json_lite, whose Object type is std::map, so dump() already sorts keys.
+// When siblings_out is given it also receives the trailing top-level entries
+// (each as ,"<key>":<value>) from this same parse — the signer needs both and
+// parsing the payload twice per publish would be wasteful.
 std::string build_command_dump(const std::string& root_key,
                                const std::string& payload,
                                EVP_PKEY*          device_pub,
-                               bool               developer_mode)
+                               bool               developer_mode,
+                               std::string*       siblings_out = nullptr)
 {
     auto root = obn::json::parse(payload);
     if (!root) return {};
     const obn::json::Value& cmd = root->find(root_key.c_str());
     if (cmd.kind() != obn::json::Value::Kind::Object) return {};
+    if (siblings_out) {
+        for (const auto& kv : root->as_object()) {
+            // "header" is ours alone: carrying a payload-supplied one would
+            // emit two header keys and put a header inside the signed
+            // pre-image, which is exactly what the signature must exclude.
+            if (kv.first == root_key || kv.first == "header") continue;
+            *siblings_out += ',';
+            *siblings_out += obn::json::Value(kv.first).dump(); // quoted+escaped
+            *siblings_out += ':';
+            *siblings_out += kv.second.dump();
+        }
+    }
     obn::json::Object obj = cmd.as_object(); // copy for mutation
     encrypt_print_fields(obj, device_pub, developer_mode);
     return obn::json::Value(std::move(obj)).dump();
@@ -365,11 +381,10 @@ static std::string json_str_escape(const std::string& s)
     return out;
 }
 
-// Emits {"header":…,"<root_key>":<body>} where <body> is the envelope-minus-
-// header INCLUDING any trailing top-level siblings (the caller passes the same
-// `body` string it signed — one string feeds both). See the invariant comment
-// at to_sign (maybe_sign) below, locked by test_trailing_sibling_reconstruction
-// in tests/signing_test.cpp.
+// Emits {"header":…,"<root_key>":dump} — `dump` here is the full body the
+// signer built (root dump plus any trailing siblings). See the invariant
+// comment at to_sign (maybe_sign) below, locked by
+// test_trailing_sibling_reconstruction in tests/signing_test.cpp.
 // Builds the complete signed envelope JSON string.
 std::string build_envelope(const std::string& to_sign,
                            const std::string& sig_b64,
@@ -430,41 +445,25 @@ std::string maybe_sign(const std::string& payload_json, EVP_PKEY* device_pub,
     EVP_PKEY* pkey = slicer_pkey();
     if (!pkey) return payload_json;
 
-    const std::string dump =
-        build_command_dump(root_key, payload_json, device_pub, developer_mode);
-    if (dump.empty()) return payload_json; // malformed; pass through
-
-    // Trailing siblings (e.g. "user_id" after the root) are part of the signed
-    // envelope-minus-header per the farm consensus (research/10.04 §Signing
-    // consensus). Re-emit every other top-level entry AFTER the root (family
-    // key first; the remaining top-level keys follow in json_lite map
-    // (lexicographic) order). Zero siblings -> empty string -> byte-exact
-    // legacy wire.
+    // Trailing top-level siblings (e.g. "user_id" next to "print" or next to
+    // "liveview") are part of the signed envelope-minus-header per the farm
+    // consensus (research/10.04, "Trailing-sibling invariant"), so they are
+    // re-emitted after the root object; "header" is dropped there. Zero
+    // siblings -> empty suffix -> the previous byte-exact single-root wire
+    // format, which is what every capture we have looks like.
     std::string siblings;
-    {
-        auto root_val = obn::json::parse(payload_json); // parse succeeded above
-        if (root_val && root_val->is_object()) {
-            for (const auto& kv : root_val->as_object()) {
-                if (kv.first == root_key) continue;
-                siblings += ',';
-                siblings += obn::json::Value(kv.first).dump(); // quoted+escaped key
-                siblings += ':';
-                siblings += kv.second.dump();
-            }
-        }
-    }
-    const std::string body = dump + siblings; // envelope-minus-header
+    const std::string dump = build_command_dump(root_key, payload_json, device_pub,
+                                                developer_mode, &siblings);
+    if (dump.empty()) return payload_json; // malformed; pass through
+    const std::string body = dump + siblings;
 
-    // SINGLE-BODY INVARIANT (locked by test_trailing_sibling_reconstruction in
-    // tests/signing_test.cpp): to_sign is exactly {"<root_key>":<body>} — the
-    // wire envelope with the header removed, trailing siblings included.
-    // ONE `body` string feeds both to_sign and build_envelope, so payload_len
-    // == bytes signed == wire bytes. Sibling order is specified and stable:
-    // the root key comes first regardless of alphabet, then the remaining
-    // top-level keys in json_lite map (lexicographic) order — byte-identical
-    // between the signed string and the wire envelope because both derive from
-    // the single body string. Zero siblings collapse to the exact legacy
-    // concatenation, so sibling-less payloads stay byte-exact.
+    // INVARIANT: to_sign is exactly {"<root_key>":<body>} — the wire envelope
+    // with the header removed, trailing siblings included. The ONE `body`
+    // string feeds both to_sign and build_envelope, so payload_len == bytes
+    // signed == wire bytes (signed==wire by construction). Sibling order:
+    // root key first regardless of alphabet, remaining top-level keys in
+    // json_lite map (lexicographic) order. Locked by
+    // test_trailing_sibling_reconstruction in tests/signing_test.cpp.
     const std::string to_sign = "{\"" + root_key + "\":" + body + "}";
 
     const std::string sig_b64 = rsa_sha256_sign_b64(
