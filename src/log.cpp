@@ -153,7 +153,13 @@ void apply_config(const obn::config::Settings& cfg)
     if (s.config_applied) return;
     s.config_applied = true;
 
-    if (!std::getenv("OBN_LOG_LEVEL") && !cfg.log_level.empty())
+    // Environment wins over the file, even when the logger already latched:
+    // any log line before this call (hydrate_env_from_state_file_once, for
+    // example) initializes the level from the env as it was back then, so a
+    // later OBN_LOG_LEVEL would otherwise be ignored (config_test:94).
+    if (const char* lv = std::getenv("OBN_LOG_LEVEL"))
+        s.level = parse_level(lv);
+    else if (!cfg.log_level.empty())
         s.level = parse_level(cfg.log_level.c_str());
 
     if (!std::getenv("OBN_LOG_STDERR") && !cfg.log_stderr.empty())
