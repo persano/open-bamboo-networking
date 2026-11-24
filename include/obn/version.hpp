@@ -1,3 +1,3 @@
 #pragma once
 
-#define OBN_PROJECT_VERSION "v2.5.11"
+#define OBN_PROJECT_VERSION "v2.5.12"
