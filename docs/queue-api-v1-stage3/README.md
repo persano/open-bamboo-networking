@@ -190,13 +190,18 @@ the reviewed upstream revision; null remains unknown. Active-source exposure, if
 needed later, should be a separate nullable field with documented evidence.
 
 Mechanical A1 plate changing uses **the same print operation**, a separate ordinary
-3MF and a fresh idempotency key/job ID. The proposed optional `supply:"none"` payload
-requires capability support, empty materials, disabled calibration/timelapse/leveling,
-and native validation of a bounded supported G-code subset with no extrusion or
-filament loading. Unknown macros/commands or an unverifiable file fail before
-dispatch. Mere user labeling or empty mapping is not proof. The accepted subset and
-firmware constraints must be agreed before advertising `none`; keep it unsupported
-until then. This is a print capability, not a special plate-changer API.
+3MF and a fresh idempotency key/job ID. The `supply:"none"` payload is
+capability-advertised: it requires empty materials, disabled
+calibration/timelapse/leveling, and native validation of a bounded supported
+G-code subset with no extrusion or filament loading. The implemented subset is an
+allowlist scanned from the submitted archive's plate gcode before dispatch:
+positive extrusion (a positive E word on G0/G1/G2/G3), heater/fan commands
+(M104, M109, M140, M190, M141, M191, M106, M107), filament change (M620, M621,
+M600), tool changes (T words) and any command outside
+{G0, G1, G2, G3, G4, G90, G91, G92, M400, M117, M84, M18} fail as `unsafe_gcode`
+before dispatch; an unverifiable archive or plate fails the same way. Mere user
+labeling or empty mapping is not proof. The subset and firmware constraints stay
+open for review. This is a print capability, not a special plate-changer API.
 
 Automatic sequencing requires matched, quiescent `completed` evidence with error 0,
 then a fresh available/idle, fault-free printer check. Failed/cancelled jobs do not
@@ -216,7 +221,7 @@ stop command. No implicit conversion from skip to stop.
 Retain existing errors. Proposed additions: `idempotency_conflict`,
 `submission_scope_changed`, `submission_store_unavailable`, `not_found`,
 `signed_out`, `not_authorized`, `stale_status`, `invalid_mapping`, `file_changed`,
-`job_mismatch`, `would_end_job`, `result_unknown`, `unsafe_file`. Only an `ok:true`
+`job_mismatch`, `would_end_job`, `result_unknown`, `unsafe_file`, `unsafe_gcode`. Only an `ok:true`
 receipt acknowledges library acceptance. Generic/internal/transport failure is
 ambiguous; recover by key. Errors must not include credentials or file contents.
 
@@ -227,7 +232,8 @@ Please review in particular:
    internal SDK retries can honor at-most-once dispatch.
 3. Correlation of the returned job ID to printer start/end identifiers, including
    external jobs and trustworthy end-G-code/quiescence evidence on A1/P1S.
-4. The optional `supply:none` validation subset (safe to defer separately).
+4. The `supply:none` subset as implemented above (allowlist detail and firmware
+   constraints on A1 remain open for review).
 5. Whether metadata needed for native material validation should be read entirely
    from 3MF, reducing the proposed redundant material fields before implementation.
 

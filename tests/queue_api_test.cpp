@@ -329,6 +329,13 @@ static void test_devices_watch_snapshot()
     CHECK(p.find("nozzle_diameter").as_number() == 0.4);
     CHECK(p.find("status_age_ms").is_number());
 
+    // Per-printer command support advertises the capability-gated
+    // supply "none" mode alongside ams/external.
+    const json::Array& sm = p.find("command_support.supply_modes").as_array();
+    CHECK(sm.size() == 3);
+    CHECK(sm[0].as_string() == "ams");
+    CHECK(sm[2].as_string() == "none");
+
     // snapshot.get for a device outside the watch set.
     e = call(client_op("snapshot.get", ",\"params\":{\"device_ids\":[\"other\"]}"));
     CHECK(err_code(e) == "device_unavailable");
@@ -555,6 +562,19 @@ static std::string print_cmd(const std::string& dev, const std::string& path,
            "\"timelapse\":false}}}";
 }
 
+// command.submit for supply "none": empty materials, options false.
+static std::string none_cmd(const std::string& dev, const std::string& path,
+                            const std::string& sha, bool bad_opt = false)
+{
+    return "{\"kind\":\"print\",\"device_id\":\"" + dev + "\",\"payload\":{"
+           "\"file\":{\"path\":\"" + path + "\",\"sha256\":\"" + sha +
+           "\",\"plate_index\":1},"
+           "\"task_tag\":\"t-none\",\"supply\":\"none\",\"materials\":[],"
+           "\"options\":{\"bed_leveling\":" +
+           std::string(bad_opt ? "true" : "false") +
+           ",\"flow_calibration\":false,\"timelapse\":false}}}";
+}
+
 // Poll command.get until the receipt leaves "accepted" (worker threads run
 // detached); returns the last observed state, "" on timeout.
 static std::string wait_receipt_state(const std::string& key,
@@ -624,13 +644,14 @@ static void test_commands()
                kDev + "\"}}");
     CHECK(err_code(e) == "not_supported");
     {
-        // supply "none" is parsed but not advertised.
+        // supply "none" now parses; print_cmd's non-empty materials
+        // fails the empty-materials rule instead of not_supported.
         std::string cmd = print_cmd(kDev, "C:/none.gcode", sha0);
         const auto pos  = cmd.find("\"supply\":\"external\"");
         cmd.replace(pos, 19, "\"supply\":\"none\"");
         e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
                    "\",\"command\":" + cmd + "}");
-        CHECK(err_code(e) == "not_supported");
+        CHECK(err_code(e) == "invalid_request");
     }
     e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
                "\",\"command\":" + print_cmd("ghost-dev", "C:/none.gcode", sha0) + "}");
@@ -779,6 +800,103 @@ static void test_commands()
                                "\",\"idempotency_key\":\"" + key5 + "\"}"));
         CHECK(e.v.find("result.error.code").as_string() == "file_changed");
     }
+
+    // --- supply "none": validation + native motion-only subset scan. ---
+    auto none_err = [&](const std::string& key) {
+        Envelope g = call(client_op(
+            "command.get",
+            ",\"params\":{\"submission_scope\":\"" + scope +
+                "\",\"idempotency_key\":\"" + key + "\"}"));
+        return g.v.find("result.error.code").as_string();
+    };
+    auto submit_none = [&](const std::string& key, const std::string& path,
+                           bool bad_opt) {
+        return submit("{\"submission_scope\":\"" + scope +
+                      "\",\"idempotency_key\":\"" + key +
+                      "\",\"command\":" + none_cmd(kDev2, path, sha0, bad_opt) +
+                      "}");
+    };
+    const std::string kKey9  = "stage3-key-00000009";
+    const std::string kKey10 = "stage3-key-00000010";
+    const std::string kKey11 = "stage3-key-00000011";
+    const std::string kKey12 = "stage3-key-00000012";
+    const std::string kKey13 = "stage3-key-00000013";
+    const std::string kKey14 = "stage3-key-00000014";
+    const std::string kKey15 = "stage3-key-00000015";
+    const std::string kKey16 = "stage3-key-00000016";
+
+    // Non-empty materials and a true calibration option reject at
+    // validation (schema: empty materials, options all false).
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               kKey9 + "\",\"command\":{\"kind\":\"print\",\"device_id\":\"" +
+               kDev2 + "\",\"payload\":{\"file\":{\"path\":\"C:/none/x.3mf\","
+               "\"sha256\":\"" + sha0 + "\",\"plate_index\":1},"
+               "\"task_tag\":\"t9\",\"supply\":\"none\","
+               "\"materials\":[{\"source_filament_id\":\"0\","
+               "\"slot_id\":\"external\",\"type\":\"PLA\",\"profile_id\":\"p0\","
+               "\"source_color\":\"#FF0000\",\"target_color\":\"#FF0000\"}],"
+               "\"options\":{\"bed_leveling\":false,\"flow_calibration\":false,"
+               "\"timelapse\":false}}}}");
+    CHECK(err_code(e) == "invalid_request");
+    e = submit_none(kKey10, "C:/none/x.3mf", true);
+    CHECK(err_code(e) == "invalid_request");
+
+    // Existing payload path (wrong hash): a conforming motion-only scan
+    // passes and the receipt fails at the hash check as file_changed.
+    std::string paypath = (cdir / "payload.gcode").string();
+    for (char& c : paypath)
+        if (c == '\\') c = '/';
+    auto write_gcode = [&](const char* name, const char* body) {
+        std::ofstream f(cdir / name, std::ios::binary | std::ios::trunc);
+        f << body;
+    };
+    write_gcode("motion_ok.gcode",
+                "G1 X10 Y10 F3000\nG1 E-2 F1800\nG4 P100\nM400\n"
+                "N12 G1 X0 Y0 F3000\n; comment only\n");
+    obn::queue::test_set_none_gcode_override(
+        (cdir / "motion_ok.gcode").string());
+    e = submit_none(kKey11, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey11, scope, 5000) == "failed");
+    CHECK(none_err(kKey11) == "file_changed");
+
+    // Positive extrusion -> unsafe_gcode before any dispatch.
+    write_gcode("motion_e.gcode", "G1 X10 Y10 F3000\nG1 E5 F2100\n");
+    obn::queue::test_set_none_gcode_override((cdir / "motion_e.gcode").string());
+    e = submit_none(kKey12, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey12, scope, 5000) == "failed");
+    CHECK(none_err(kKey12) == "unsafe_gcode");
+
+    // Heater, tool change and unknown macro fail closed.
+    write_gcode("motion_hot.gcode", "M104 S210\n");
+    obn::queue::test_set_none_gcode_override((cdir / "motion_hot.gcode").string());
+    e = submit_none(kKey13, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey13, scope, 5000) == "failed");
+    CHECK(none_err(kKey13) == "unsafe_gcode");
+
+    write_gcode("motion_tool.gcode", "T0\n");
+    obn::queue::test_set_none_gcode_override((cdir / "motion_tool.gcode").string());
+    e = submit_none(kKey14, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey14, scope, 5000) == "failed");
+    CHECK(none_err(kKey14) == "unsafe_gcode");
+
+    write_gcode("motion_macro.gcode", "M900 K0.44\n");
+    obn::queue::test_set_none_gcode_override((cdir / "motion_macro.gcode").string());
+    e = submit_none(kKey15, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey15, scope, 5000) == "failed");
+    CHECK(none_err(kKey15) == "unsafe_gcode");
+
+    // Override off: an unreadable archive fails closed as unsafe_gcode.
+    obn::queue::test_set_none_gcode_override("");
+    e = submit_none(kKey16, "C:/obn-no-such/no.gcode", false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey16, scope, 5000) == "failed");
+    CHECK(none_err(kKey16) == "unsafe_gcode");
+    obn::queue::test_set_none_gcode_override("");
 
     // Both worker failures released the kDev2 lane: a fresh key accepts.
     obn::queue::test_set_dispatch_enabled(false);

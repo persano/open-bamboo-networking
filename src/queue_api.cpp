@@ -19,6 +19,7 @@
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
 #include "obn/receipt_store.hpp"
+#include "obn/zip_read.hpp"
 
 #include <openssl/evp.h>
 
@@ -94,9 +95,9 @@ bool dispatch_enabled()
 }
 
 // Stage-3 advertised command surface (global capabilities and per-printer
-// command_support): skip_objects and supply "none" stay unadvertised
-// until their validation subsets exist (README: keep unsupported until
-// agreed).
+// command_support): skip_objects stays unadvertised until its validation
+// subset exists (README: keep unsupported until agreed). supply "none"
+// ships capability-gated behind the motion-only subset scan below.
 json::Array command_kinds_array()
 {
     json::Array a;
@@ -114,7 +115,7 @@ json::Array print_options_array()
 json::Array supply_modes_array()
 {
     json::Array a;
-    for (const char* k : {"ams", "external"})
+    for (const char* k : {"ams", "external", "none"})
         a.push_back(json::Value(k));
     return a;
 }
@@ -1067,6 +1068,205 @@ std::string sha256_file_hex(const std::string& path, bool* exists)
     return out;
 }
 
+// --- supply "none" motion-only subset (docs/queue-api-v1-stage3/README) --
+// A "none" submission carries no material mapping, so the library must
+// itself prove the archive cannot extrude, heat or change filament before
+// dispatch: the scan is an allowlist and fails closed on anything unknown.
+
+// Test-only plain-text redirect (queue_api_test); empty = scan the archive.
+std::string g_none_gcode_override;
+
+constexpr std::size_t kMaxNoneGcodeBytes = 1024 * 1024;
+
+std::string ascii_upper(std::string s)
+{
+    for (char& c : s)
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    return s;
+}
+
+struct GWord {
+    std::size_t b = 0;
+    std::size_t e = 0;
+};
+
+// Next whitespace-delimited word at/after `from`; b == e at the end.
+GWord gword(const std::string& s, std::size_t from)
+{
+    std::size_t b = from;
+    while (b < s.size() && (s[b] == ' ' || s[b] == '\t')) ++b;
+    std::size_t e = b;
+    while (e < s.size() && s[e] != ' ' && s[e] != '\t') ++e;
+    return {b, e};
+}
+
+// True when the word list after a motion word carries a positive E
+// (extrusion). A signed negative E (retract) passes; a malformed value
+// fails closed.
+bool has_positive_e(const std::string& line, std::size_t from)
+{
+    for (;;) {
+        const GWord    w = gword(line, from);
+        if (w.b == w.e) return false;
+        const std::string t = line.substr(w.b, w.e - w.b);
+        if (!t.empty() && (t[0] == 'E' || t[0] == 'e')) {
+            if (t.size() == 1) return true;
+            char*        end = nullptr;
+            const double d   = std::strtod(t.c_str() + 1, &end);
+            if (end == t.c_str() + 1 || *end != '\0') return true;
+            if (d > 0.0) return true;
+        }
+        from = w.e;
+    }
+}
+
+// Returns nullptr when the text is inside the accepted motion-only
+// subset, else a short reason (contract: unknown macros fail closed).
+const char* gcode_motion_only(const std::string& text)
+{
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t star = line.find('*'); // trailing checksum
+        if (star != std::string::npos) line.erase(star);
+
+        GWord w = gword(line, 0);
+        if (w.b == w.e) continue;
+        std::string word = ascii_upper(line.substr(w.b, w.e - w.b));
+        if (word.size() > 1 && word[0] == 'N' &&
+            word.find_first_not_of("0123456789", 1) == std::string::npos) {
+            w = gword(line, w.e); // N<line number> prefix
+            if (w.b == w.e) continue;
+            word = ascii_upper(line.substr(w.b, w.e - w.b));
+        }
+        if (word.empty()) continue;
+        if (word[0] == ';' || word[0] == '(') continue;
+
+        if (word == "G0" || word == "G1" || word == "G2" || word == "G3") {
+            if (has_positive_e(line, w.e)) return "positive extrusion move";
+            continue;
+        }
+        if (word == "G4" || word == "G90" || word == "G91" || word == "G92" ||
+            word == "M400" || word == "M117" || word == "M84" || word == "M18")
+            continue;
+        if (word[0] == 'T') return "tool change command";
+        if (word == "M620" || word == "M621" || word == "M600")
+            return "filament change command";
+        if (word == "M104" || word == "M109" || word == "M140" ||
+            word == "M190" || word == "M141" || word == "M191" ||
+            word == "M106" || word == "M107")
+            return "heater or fan command";
+        return "unsupported command";
+    }
+    return nullptr;
+}
+
+// Resolves the gcode entry for `plate`: plate blocks in
+// Metadata/model_settings.config document order, matched on their
+// plater_id, map to Metadata/plate_<order>_gcode.gcode (the file naming
+// is by document order). Archives without the config only support
+// plate 1.
+bool none_gcode_entry(const std::string& zip_path, int plate,
+                      std::string* entry, const char** err)
+{
+    std::vector<std::uint8_t> cfg;
+    if (!obn::zip::read_entry(zip_path, "Metadata/model_settings.config",
+                              kMaxNoneGcodeBytes, &cfg) || cfg.empty()) {
+        if (plate == 1) {
+            *entry = "Metadata/plate_1_gcode.gcode";
+            return true;
+        }
+        *err = "cannot resolve plate in archive";
+        return false;
+    }
+    const std::string xml(cfg.begin(), cfg.end());
+    int               order = 0;
+    std::size_t       p     = 0;
+    while ((p = xml.find("<plate", p)) != std::string::npos) {
+        const char next = p + 6 < xml.size() ? xml[p + 6] : '\0';
+        if (next != '>' && next != ' ' && next != '\r' && next != '\n' &&
+            next != '\t') {
+            p += 6;
+            continue;
+        }
+        const std::size_t close = xml.find("</plate>", p);
+        if (close == std::string::npos) break;
+        const std::string block = xml.substr(p, close - p);
+        ++order;
+        int plater_id = order; // default to document position
+        const std::size_t key = block.find("type=\"plater_id\"");
+        if (key != std::string::npos) {
+            const std::size_t gt = block.find('>', key);
+            const std::size_t lt =
+                gt == std::string::npos ? std::string::npos
+                                        : block.find('<', gt);
+            if (lt != std::string::npos && lt > gt + 1) {
+                const int id = std::atoi(block.c_str() + gt + 1);
+                if (id > 0) plater_id = id;
+            }
+        }
+        if (plater_id == plate) {
+            *entry = "Metadata/plate_" + std::to_string(order) +
+                     "_gcode.gcode";
+            return true;
+        }
+        p = close + 8;
+    }
+    if (order == 0 && plate == 1) {
+        *entry = "Metadata/plate_1_gcode.gcode";
+        return true;
+    }
+    *err = "plate_index not found in archive";
+    return false;
+}
+
+// Full pre-dispatch check for a supply "none" submission: parse the
+// submitted archive (or the test override) and scan its plate gcode.
+bool none_gcode_motion_only(const std::string& path, int plate,
+                            const char** err)
+{
+    std::string text;
+    if (!g_none_gcode_override.empty()) {
+        std::ifstream in(g_none_gcode_override, std::ios::binary);
+        if (!in) {
+            *err = "gcode override unreadable";
+            return false;
+        }
+        in.seekg(0, std::ios::end);
+        const std::streamoff n = in.tellg();
+        if (n < 0 || static_cast<std::size_t>(n) > kMaxNoneGcodeBytes) {
+            *err = "gcode exceeds motion-only size bound";
+            return false;
+        }
+        in.seekg(0, std::ios::beg);
+        text.resize(static_cast<std::size_t>(n));
+        if (n > 0) in.read(&text[0], n);
+        if (!in && !in.eof()) {
+            *err = "gcode override unreadable";
+            return false;
+        }
+    } else {
+        std::string entry;
+        if (!none_gcode_entry(path, plate, &entry, err)) return false;
+        std::vector<std::uint8_t> bytes;
+        if (!obn::zip::read_entry(path, entry, kMaxNoneGcodeBytes, &bytes)) {
+            *err = "cannot read gcode from archive";
+            return false;
+        }
+        text.assign(bytes.begin(), bytes.end());
+    }
+    const char* bad = gcode_motion_only(text);
+    if (bad) {
+        *err = bad;
+        return false;
+    }
+    return true;
+}
+
 // Canonical fingerprint: SHA-256 over the re-dumped command object.
 // json::Object is an ordered map, so member order and whitespace
 // normalize away; array order and values stay significant (contract
@@ -1432,20 +1632,20 @@ bool parse_command(const json::Value& cmd, SubmitCommand* out,
     out->task_tag = gv(po, "task_tag").as_string();
 
     const std::string supply = gv(po, "supply").as_string();
-    if (supply == "none") {
-        *code = "not_supported";
-        *err  = "supply mode none is not advertised";
-        return false;
-    }
-    if (supply != "ams" && supply != "external") {
-        *err = "supply must be \"ams\" or \"external\"";
+    if (supply != "ams" && supply != "external" && supply != "none") {
+        *err = "supply must be \"ams\", \"external\" or \"none\"";
         return false;
     }
     out->supply = supply;
 
     const json::Value& mats = gv(po, "materials");
-    if (!mats.is_array() || mats.as_array().size() < 1 ||
-        mats.as_array().size() > 64) {
+    if (supply == "none") {
+        if (!mats.is_array() || !mats.as_array().empty()) {
+            *err = "supply \"none\" requires an empty materials array";
+            return false;
+        }
+    } else if (!mats.is_array() || mats.as_array().size() < 1 ||
+               mats.as_array().size() > 64) {
         *err = "materials must be an array of 1..64 entries";
         return false;
     }
@@ -1528,6 +1728,12 @@ bool parse_command(const json::Value& cmd, SubmitCommand* out,
     out->bed_leveling     = gv(opts.as_object(), "bed_leveling").as_bool();
     out->flow_calibration = gv(opts.as_object(), "flow_calibration").as_bool();
     out->timelapse        = gv(opts.as_object(), "timelapse").as_bool();
+    if (supply == "none" &&
+        (out->bed_leveling || out->flow_calibration || out->timelapse)) {
+        *err = "supply \"none\" requires options bed_leveling, flow_calibration "
+               "and timelapse false";
+        return false;
+    }
 
     out->command = cmd;
     return true;
@@ -2096,7 +2302,18 @@ void worker_print(std::string key, SubmitCommand sc, std::string epoch)
     }
 
     // File verification before any dispatch boundary: file errors are
-    // retained receipt failures, never uploads (contract).
+    // retained receipt failures, never uploads (contract). supply "none"
+    // additionally proves the archive stays inside the motion-only subset
+    // before the hash: a conforming-but-changed file still fails below as
+    // file_changed, anything outside the subset never reaches dispatch.
+    if (sc.supply == "none") {
+        const char* sub_err = nullptr;
+        if (!none_gcode_motion_only(sc.file_path, sc.plate_index, &sub_err)) {
+            fail_pre("unsafe_gcode", false,
+                     sub_err ? sub_err : "gcode outside motion-only subset");
+            return;
+        }
+    }
     bool               exists = false;
     const std::string  digest = sha256_file_hex(sc.file_path, &exists);
     if (!exists || digest.empty()) {
@@ -2716,6 +2933,11 @@ void test_clear_command_session()
 void test_set_dispatch_enabled(bool enabled)
 {
     g_test_dispatch_on = enabled;
+}
+
+void test_set_none_gcode_override(const std::string& path)
+{
+    g_none_gcode_override = path;
 }
 #endif
 
