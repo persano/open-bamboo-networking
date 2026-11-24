@@ -1118,6 +1118,8 @@ json::Value capabilities_result()
     limits["max_devices_per_client"]       = json::Value(static_cast<double>(kMaxDevicesPerClient));
     limits["max_clients"]                  = json::Value(static_cast<double>(kMaxClients));
     limits["max_pending_commands"]         = json::Value(8.0);
+    // Legacy per-client cap, retained for backward compatibility (PR #7).
+    // Authoritative durable capacity is submission.max_retained_keys above.
     limits["max_command_receipts_per_client"] = json::Value(4096.0);
     limits["event_capacity"]               = json::Value(static_cast<double>(kEventCapacity));
     limits["event_retention_seconds"]      = json::Value(static_cast<double>(kEventRetentionSec));
