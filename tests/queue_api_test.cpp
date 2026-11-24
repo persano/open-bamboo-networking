@@ -852,7 +852,8 @@ static void test_commands()
     };
     write_gcode("motion_ok.gcode",
                 "G1 X10 Y10 F3000\nG1 E-2 F1800\nG4 P100\nM400\n"
-                "N12 G1 X0 Y0 F3000\n; comment only\n");
+                "N12 G1 X0 Y0 F3000\nG28\nM17\nM73 P50\nM104 S0\nM140 S0\n"
+                "M18\n; comment only\n");
     obn::queue::test_set_none_gcode_override(
         (cdir / "motion_ok.gcode").string());
     e = submit_none(kKey11, paypath, false);
@@ -896,6 +897,26 @@ static void test_commands()
     CHECK(ok(e));
     CHECK(wait_receipt_state(kKey16, scope, 5000) == "failed");
     CHECK(none_err(kKey16) == "unsafe_gcode");
+
+    // Non-zero heater target, the inventory items still pending review
+    // and ambiguous syntax all stay rejected (PR #7 review).
+    struct { const char* name; const char* body; const char* key; } rej[] = {
+        {"motion_heat.gcode", "M104 S200\n", "stage3-key-00000017"},
+        {"motion_fan.gcode", "M106 S255\n", "stage3-key-00000018"},
+        {"motion_limit.gcode", "M203 X300\n", "stage3-key-00000019"},
+        {"motion_prop.gcode", "M1002 set_filament_type:PLA\n",
+         "stage3-key-00000020"},
+        {"motion_ambig.gcode", ":G1 Y-2 F20000\n", "stage3-key-00000021"},
+    };
+    for (const auto& r : rej) {
+        write_gcode(r.name, r.body);
+        obn::queue::test_set_none_gcode_override(
+            (cdir / r.name).string());
+        e = submit_none(r.key, paypath, false);
+        CHECK(ok(e));
+        CHECK(wait_receipt_state(r.key, scope, 5000) == "failed");
+        CHECK(none_err(r.key) == "unsafe_gcode");
+    }
     obn::queue::test_set_none_gcode_override("");
 
     // Both worker failures released the kDev2 lane: a fresh key accepts.

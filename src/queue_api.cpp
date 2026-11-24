@@ -1122,6 +1122,57 @@ bool has_positive_e(const std::string& line, std::size_t from)
 
 // Returns nullptr when the text is inside the accepted motion-only
 // subset, else a short reason (contract: unknown macros fail closed).
+
+// A full token must parse as a finite number.
+bool numeric_word(const char* s)
+{
+    if (!*s) return false;
+    char*        end = nullptr;
+    const double d   = std::strtod(s, &end);
+    return end != s && *end == '\0' && std::isfinite(d);
+}
+
+// G28/M17 argument check: bare, or axis selection words only (X/Y/Z).
+// An E word here would be meaningless, so it fails.
+bool axis_words_only(const std::string& line, std::size_t from)
+{
+    for (;;) {
+        const GWord w = gword(line, from);
+        if (w.b == w.e) return true;
+        const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
+        if (t[0] != 'X' && t[0] != 'Y' && t[0] != 'Z') return false;
+        from = w.e;
+    }
+}
+
+// M73 progress: P/R/S with finite numeric values only.
+bool m73_words(const std::string& line, std::size_t from)
+{
+    for (;;) {
+        const GWord w = gword(line, from);
+        if (w.b == w.e) return true;
+        const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
+        if (t.size() < 2 || (t[0] != 'P' && t[0] != 'R' && t[0] != 'S'))
+            return false;
+        if (!numeric_word(t.c_str() + 1)) return false;
+        from = w.e;
+    }
+}
+
+// M104/M140 accept exactly one word: S with value 0 (heater off). No
+// target, a non-numeric target or any trailing word fails closed.
+bool heater_off_words(const std::string& line, std::size_t from)
+{
+    const GWord w = gword(line, from);
+    if (w.b == w.e) return false;
+    const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
+    if (t.size() < 2 || t[0] != 'S' || !numeric_word(t.c_str() + 1))
+        return false;
+    if (std::strtod(t.c_str() + 1, nullptr) != 0.0) return false;
+    const GWord w2 = gword(line, w.e);
+    return w2.b == w2.e;
+}
+
 const char* gcode_motion_only(const std::string& text)
 {
     std::size_t pos = 0;
@@ -1150,78 +1201,43 @@ const char* gcode_motion_only(const std::string& text)
             if (has_positive_e(line, w.e)) return "positive extrusion move";
             continue;
         }
+        if (word == "G28") {
+            if (!axis_words_only(line, w.e)) return "unsupported G28 argument";
+            continue;
+        }
         if (word == "G4" || word == "G90" || word == "G91" || word == "G92" ||
             word == "M400" || word == "M117" || word == "M84" || word == "M18")
             continue;
+        if (word == "M17") {
+            if (!axis_words_only(line, w.e)) return "unsupported M17 argument";
+            continue;
+        }
+        if (word == "M73") {
+            if (!m73_words(line, w.e)) return "unsupported M73 argument";
+            continue;
+        }
+        if (word == "M104" || word == "M140") {
+            if (!heater_off_words(line, w.e))
+                return "heater target must be S0";
+            continue;
+        }
         if (word[0] == 'T') return "tool change command";
         if (word == "M620" || word == "M621" || word == "M600")
             return "filament change command";
-        if (word == "M104" || word == "M109" || word == "M140" ||
-            word == "M190" || word == "M141" || word == "M191" ||
-            word == "M106" || word == "M107")
+        if (word == "M109" || word == "M190" || word == "M141" ||
+            word == "M191" || word == "M106" || word == "M107")
             return "heater or fan command";
         return "unsupported command";
     }
     return nullptr;
 }
 
-// Resolves the gcode entry for `plate`: plate blocks in
-// Metadata/model_settings.config document order, matched on their
-// plater_id, map to Metadata/plate_<order>_gcode.gcode (the file naming
-// is by document order). Archives without the config only support
-// plate 1.
-bool none_gcode_entry(const std::string& zip_path, int plate,
-                      std::string* entry, const char** err)
+// The archive entry the printer itself extracts for this plate:
+// build_project_file_json writes param = Metadata/plate_<N>.gcode
+// (print_job.cpp), so the validator reads exactly what the printer reads.
+std::string none_gcode_entry(int plate)
 {
-    std::vector<std::uint8_t> cfg;
-    if (!obn::zip::read_entry(zip_path, "Metadata/model_settings.config",
-                              kMaxNoneGcodeBytes, &cfg) || cfg.empty()) {
-        if (plate == 1) {
-            *entry = "Metadata/plate_1_gcode.gcode";
-            return true;
-        }
-        *err = "cannot resolve plate in archive";
-        return false;
-    }
-    const std::string xml(cfg.begin(), cfg.end());
-    int               order = 0;
-    std::size_t       p     = 0;
-    while ((p = xml.find("<plate", p)) != std::string::npos) {
-        const char next = p + 6 < xml.size() ? xml[p + 6] : '\0';
-        if (next != '>' && next != ' ' && next != '\r' && next != '\n' &&
-            next != '\t') {
-            p += 6;
-            continue;
-        }
-        const std::size_t close = xml.find("</plate>", p);
-        if (close == std::string::npos) break;
-        const std::string block = xml.substr(p, close - p);
-        ++order;
-        int plater_id = order; // default to document position
-        const std::size_t key = block.find("type=\"plater_id\"");
-        if (key != std::string::npos) {
-            const std::size_t gt = block.find('>', key);
-            const std::size_t lt =
-                gt == std::string::npos ? std::string::npos
-                                        : block.find('<', gt);
-            if (lt != std::string::npos && lt > gt + 1) {
-                const int id = std::atoi(block.c_str() + gt + 1);
-                if (id > 0) plater_id = id;
-            }
-        }
-        if (plater_id == plate) {
-            *entry = "Metadata/plate_" + std::to_string(order) +
-                     "_gcode.gcode";
-            return true;
-        }
-        p = close + 8;
-    }
-    if (order == 0 && plate == 1) {
-        *entry = "Metadata/plate_1_gcode.gcode";
-        return true;
-    }
-    *err = "plate_index not found in archive";
-    return false;
+    return "Metadata/plate_" + std::to_string(plate) + ".gcode";
 }
 
 // Full pre-dispatch check for a supply "none" submission: parse the
@@ -1250,11 +1266,10 @@ bool none_gcode_motion_only(const std::string& path, int plate,
             return false;
         }
     } else {
-        std::string entry;
-        if (!none_gcode_entry(path, plate, &entry, err)) return false;
         std::vector<std::uint8_t> bytes;
+        const std::string          entry = none_gcode_entry(plate);
         if (!obn::zip::read_entry(path, entry, kMaxNoneGcodeBytes, &bytes)) {
-            *err = "cannot read gcode from archive";
+            *err = "cannot read plate gcode from archive";
             return false;
         }
         text.assign(bytes.begin(), bytes.end());
