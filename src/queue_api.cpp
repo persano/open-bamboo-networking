@@ -97,7 +97,9 @@ bool dispatch_enabled()
 // Stage-3 advertised command surface (global capabilities and per-printer
 // command_support): skip_objects stays unadvertised until its validation
 // subset exists (README: keep unsupported until agreed). supply "none"
-// ships capability-gated behind the motion-only subset scan below.
+// ships capability-gated as the user-confirmed no-automatic-filament-
+// loading mode: container checks only, G-code content is the user's
+// responsibility (README boundary).
 json::Array command_kinds_array()
 {
     json::Array a;
@@ -1068,217 +1070,32 @@ std::string sha256_file_hex(const std::string& path, bool* exists)
     return out;
 }
 
-// --- supply "none" motion-only subset (docs/queue-api-v1-stage3/README) --
-// A "none" submission carries no material mapping, so the library must
-// itself prove the archive cannot extrude, heat or change filament before
-// dispatch: the scan is an allowlist and fails closed on anything unknown.
+// --- supply "none" container check (docs/queue-api-v1-stage3/README) -----
+// "none" is the user-confirmed "no automatic filament loading" mode: the
+// library must not initiate filament loading or require an AMS/external
+// selection, and certifies only container integrity. The G-code content
+// of a user-supplied file is the user's responsibility, never scanned.
 
-// Test-only plain-text redirect (queue_api_test); empty = scan the archive.
-std::string g_none_gcode_override;
-
-constexpr std::size_t kMaxNoneGcodeBytes = 1024 * 1024;
-
-std::string ascii_upper(std::string s)
-{
-    for (char& c : s)
-        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    return s;
-}
-
-struct GWord {
-    std::size_t b = 0;
-    std::size_t e = 0;
-};
-
-// Next whitespace-delimited word at/after `from`; b == e at the end.
-GWord gword(const std::string& s, std::size_t from)
-{
-    std::size_t b = from;
-    while (b < s.size() && (s[b] == ' ' || s[b] == '\t')) ++b;
-    std::size_t e = b;
-    while (e < s.size() && s[e] != ' ' && s[e] != '\t') ++e;
-    return {b, e};
-}
-
-// True when the word list after a motion word carries a positive E
-// (extrusion). A signed negative E (retract) passes; a malformed value
-// fails closed.
-bool has_positive_e(const std::string& line, std::size_t from)
-{
-    for (;;) {
-        const GWord    w = gword(line, from);
-        if (w.b == w.e) return false;
-        const std::string t = line.substr(w.b, w.e - w.b);
-        if (!t.empty() && (t[0] == 'E' || t[0] == 'e')) {
-            if (t.size() == 1) return true;
-            char*        end = nullptr;
-            const double d   = std::strtod(t.c_str() + 1, &end);
-            if (end == t.c_str() + 1 || *end != '\0') return true;
-            if (d > 0.0) return true;
-        }
-        from = w.e;
-    }
-}
-
-// Returns nullptr when the text is inside the accepted motion-only
-// subset, else a short reason (contract: unknown macros fail closed).
-
-// A full token must parse as a finite number.
-bool numeric_word(const char* s)
-{
-    if (!*s) return false;
-    char*        end = nullptr;
-    const double d   = std::strtod(s, &end);
-    return end != s && *end == '\0' && std::isfinite(d);
-}
-
-// G28/M17 argument check: bare, or axis selection words only (X/Y/Z).
-// An E word here would be meaningless, so it fails.
-bool axis_words_only(const std::string& line, std::size_t from)
-{
-    for (;;) {
-        const GWord w = gword(line, from);
-        if (w.b == w.e) return true;
-        const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
-        if (t[0] != 'X' && t[0] != 'Y' && t[0] != 'Z') return false;
-        from = w.e;
-    }
-}
-
-// M73 progress: P/R/S with finite numeric values only.
-bool m73_words(const std::string& line, std::size_t from)
-{
-    for (;;) {
-        const GWord w = gword(line, from);
-        if (w.b == w.e) return true;
-        const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
-        if (t.size() < 2 || (t[0] != 'P' && t[0] != 'R' && t[0] != 'S'))
-            return false;
-        if (!numeric_word(t.c_str() + 1)) return false;
-        from = w.e;
-    }
-}
-
-// M104/M140/M106 accept exactly one word: S with value 0 (heater or fan
-// off; the only forms observed in the kit archive). No target, a
-// non-numeric target or any trailing word fails closed.
-bool sole_s0_words(const std::string& line, std::size_t from)
-{
-    const GWord w = gword(line, from);
-    if (w.b == w.e) return false;
-    const std::string t = ascii_upper(line.substr(w.b, w.e - w.b));
-    if (t.size() < 2 || t[0] != 'S' || !numeric_word(t.c_str() + 1))
-        return false;
-    if (std::strtod(t.c_str() + 1, nullptr) != 0.0) return false;
-    const GWord w2 = gword(line, w.e);
-    return w2.b == w2.e;
-}
-
-const char* gcode_motion_only(const std::string& text)
-{
-    std::size_t pos = 0;
-    while (pos <= text.size()) {
-        std::size_t nl = text.find('\n', pos);
-        if (nl == std::string::npos) nl = text.size();
-        std::string line = text.substr(pos, nl - pos);
-        pos = nl + 1;
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const std::size_t semi = line.find(';'); // comment to end of line
-        if (semi != std::string::npos) line.erase(semi);
-        const std::size_t star = line.find('*'); // trailing checksum
-        if (star != std::string::npos) line.erase(star);
-
-        GWord w = gword(line, 0);
-        if (w.b == w.e) continue;
-        std::string word = ascii_upper(line.substr(w.b, w.e - w.b));
-        if (word.size() > 1 && word[0] == 'N' &&
-            word.find_first_not_of("0123456789", 1) == std::string::npos) {
-            w = gword(line, w.e); // N<line number> prefix
-            if (w.b == w.e) continue;
-            word = ascii_upper(line.substr(w.b, w.e - w.b));
-        }
-        if (word.empty()) continue;
-        if (word[0] == '(') continue;
-
-        if (word == "G0" || word == "G1" || word == "G2" || word == "G3") {
-            if (has_positive_e(line, w.e)) return "positive extrusion move";
-            continue;
-        }
-        if (word == "G28") {
-            if (!axis_words_only(line, w.e)) return "unsupported G28 argument";
-            continue;
-        }
-        if (word == "G4" || word == "G90" || word == "G91" || word == "G92" ||
-            word == "M400" || word == "M117" || word == "M84" || word == "M18")
-            continue;
-        if (word == "M17") {
-            if (!axis_words_only(line, w.e)) return "unsupported M17 argument";
-            continue;
-        }
-        if (word == "M73") {
-            if (!m73_words(line, w.e)) return "unsupported M73 argument";
-            continue;
-        }
-        if (word == "M104" || word == "M140" || word == "M106") {
-            if (!sole_s0_words(line, w.e)) return "target must be S0";
-            continue;
-        }
-        if (word[0] == 'T') return "tool change command";
-        if (word == "M620" || word == "M621" || word == "M600")
-            return "filament change command";
-        if (word == "M109" || word == "M190" || word == "M141" ||
-            word == "M191" || word == "M107")
-            return "heater or fan command";
-        return "unsupported command";
-    }
-    return nullptr;
-}
+constexpr std::size_t kMaxNoneGcodeBytes = 64 * 1024 * 1024;
 
 // The archive entry the printer itself extracts for this plate:
 // build_project_file_json writes param = Metadata/plate_<N>.gcode
-// (print_job.cpp), so the validator reads exactly what the printer reads.
+// (print_job.cpp), so the check reads exactly what the printer reads.
 std::string none_gcode_entry(int plate)
 {
     return "Metadata/plate_" + std::to_string(plate) + ".gcode";
 }
 
-// Full pre-dispatch check for a supply "none" submission: parse the
-// submitted archive (or the test override) and scan its plate gcode.
-bool none_gcode_motion_only(const std::string& path, int plate,
-                            const char** err)
+// Container integrity for supply "none": the archive must parse and
+// carry this plate's gcode entry; zip::read_entry also verifies the
+// entry CRC-32. Content is never inspected.
+bool none_gcode_entry_present(const std::string& path, int plate,
+                              const char** err)
 {
-    std::string text;
-    if (!g_none_gcode_override.empty()) {
-        std::ifstream in(g_none_gcode_override, std::ios::binary);
-        if (!in) {
-            *err = "gcode override unreadable";
-            return false;
-        }
-        in.seekg(0, std::ios::end);
-        const std::streamoff n = in.tellg();
-        if (n < 0 || static_cast<std::size_t>(n) > kMaxNoneGcodeBytes) {
-            *err = "gcode exceeds motion-only size bound";
-            return false;
-        }
-        in.seekg(0, std::ios::beg);
-        text.resize(static_cast<std::size_t>(n));
-        if (n > 0) in.read(&text[0], n);
-        if (!in && !in.eof()) {
-            *err = "gcode override unreadable";
-            return false;
-        }
-    } else {
-        std::vector<std::uint8_t> bytes;
-        const std::string          entry = none_gcode_entry(plate);
-        if (!obn::zip::read_entry(path, entry, kMaxNoneGcodeBytes, &bytes)) {
-            *err = "cannot read plate gcode from archive";
-            return false;
-        }
-        text.assign(bytes.begin(), bytes.end());
-    }
-    const char* bad = gcode_motion_only(text);
-    if (bad) {
-        *err = bad;
+    std::vector<std::uint8_t> bytes;
+    if (!obn::zip::read_entry(path, none_gcode_entry(plate),
+                              kMaxNoneGcodeBytes, &bytes)) {
+        *err = "cannot read plate gcode from archive";
         return false;
     }
     return true;
@@ -2320,14 +2137,15 @@ void worker_print(std::string key, SubmitCommand sc, std::string epoch)
 
     // File verification before any dispatch boundary: file errors are
     // retained receipt failures, never uploads (contract). supply "none"
-    // additionally proves the archive stays inside the motion-only subset
-    // before the hash: a conforming-but-changed file still fails below as
-    // file_changed, anything outside the subset never reaches dispatch.
+    // runs a container integrity check first: the archive must carry the
+    // plate gcode entry the printer will extract. The file's G-code
+    // content is the user's responsibility (contract README boundary) and
+    // is never inspected.
     if (sc.supply == "none") {
         const char* sub_err = nullptr;
-        if (!none_gcode_motion_only(sc.file_path, sc.plate_index, &sub_err)) {
+        if (!none_gcode_entry_present(sc.file_path, sc.plate_index, &sub_err)) {
             fail_pre("unsafe_gcode", false,
-                     sub_err ? sub_err : "gcode outside motion-only subset");
+                     sub_err ? sub_err : "archive lacks plate gcode entry");
             return;
         }
     }
@@ -2950,11 +2768,6 @@ void test_clear_command_session()
 void test_set_dispatch_enabled(bool enabled)
 {
     g_test_dispatch_on = enabled;
-}
-
-void test_set_none_gcode_override(const std::string& path)
-{
-    g_none_gcode_override = path;
 }
 #endif
 

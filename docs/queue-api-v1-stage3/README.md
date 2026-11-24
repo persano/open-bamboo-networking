@@ -191,26 +191,21 @@ needed later, should be a separate nullable field with documented evidence.
 
 Mechanical A1 plate changing uses **the same print operation**, a separate ordinary
 3MF and a fresh idempotency key/job ID. The `supply:"none"` payload is
-capability-advertised: it requires empty materials, disabled
-calibration/timelapse/leveling, and native validation of a bounded supported
-G-code subset with no extrusion or filament loading. The implemented subset is an
-allowlist scanned from `Metadata/plate_<plate_index>.gcode` (the same entry the
-printer extracts as `param` from `build_project_file_json`) before dispatch.
-Lines are truncated at `;` comments, and `*` checksums are stripped before parsing.
-Accepted, with bounded or no arguments: `G0`, `G1`, `G2`, `G3` (no positive `E`
-word; a signed negative `E` retract passes, and `E` parameters on non-motion
-lines such as `M201`/`M203`/`M205`/`M1006` are never read as extrusion), `G28`
-and `M17` (bare or `X`/`Y`/`Z` axis words only), `G4`, `G90`, `G91`, `G92`, `M73`
-(finite numeric `P`/`R`/`S` only), `M400`, `M117`, `M84`, `M18`, and `M104`/
-`M140`/`M106` only as the sole argument `S0`. Everything else fails as
-`unsafe_gcode` before dispatch: positive extrusion, any non-zero `S` target on
-`M104`/`M140`/`M106`, `M109`, `M190`, `M141`, `M191`, `M107`, the machine limit
-writes `M201`, `M203`, `M204`, `M205`, the proprietary `G380`, `G392`, `M9833.2`,
-`M1002`, `M1006`, filament change (`M620`, `M621`, `M600`), `T` words, ambiguous
-syntax such as a leading colon, and any command outside the allowlist; an
-unverifiable archive or plate fails the same way. Mere user labeling or empty
-mapping is not proof. The pending commands and firmware constraints stay open
-for review. This is a print capability, not a special plate-changer API.
+capability-advertised and means user-confirmed "no automatic filament loading":
+the queue must not initiate filament loading or require an AMS or external-spool
+selection for this submission, and calibration, timelapse and bed-leveling
+options must all be false. The responsibility boundary is deliberate: the plugin
+owns correct submission, sequencing, duplicate prevention and correlated
+terminal evidence; the user owns whether their selected 3MF suits their printer
+and plate-change hardware. The library therefore performs container and
+integrity checks only for this mode: the submitted bytes must match the declared
+SHA-256, and the archive must carry its `Metadata/plate_<plate_index>.gcode`
+entry (the same entry the printer extracts as `param` from
+`build_project_file_json`); a failure reports as `file_changed` or
+`unsafe_gcode` before dispatch. The library makes no claim about the file's
+G-code content: no extrusion, heating or macro verification is performed or
+required, and the submission is sent unchanged. The confirming UI lives on the
+client side; this stays a print capability, not a special plate-changer API.
 
 Automatic sequencing requires matched, quiescent `completed` evidence with error 0,
 then a fresh available/idle, fault-free printer check. Failed/cancelled jobs do not
@@ -241,8 +236,9 @@ Please review in particular:
    internal SDK retries can honor at-most-once dispatch.
 3. Correlation of the returned job ID to printer start/end identifiers, including
    external jobs and trustworthy end-G-code/quiescence evidence on A1/P1S.
-4. The `supply:none` subset as implemented above (allowlist detail and firmware
-   constraints on A1 remain open for review).
+4. The responsibility boundary for `supply:none` as written above
+   (user-confirmed suitability, container and integrity checks only in the
+   library, no G-code content certification).
 5. Whether metadata needed for native material validation should be read entirely
    from 3MF, reducing the proposed redundant material fields before implementation.
 

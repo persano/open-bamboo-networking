@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -575,6 +576,53 @@ static std::string none_cmd(const std::string& dev, const std::string& path,
            ",\"flow_calibration\":false,\"timelapse\":false}}}";
 }
 
+static std::uint32_t crc32_bytes(const std::string& s)
+{
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (unsigned char c : s) {
+        crc ^= c;
+        for (int i = 0; i < 8; ++i)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+// Minimal single-entry STORED zip carrying one plate gcode entry: local
+// header, central directory, EOCD (sizes always from the central
+// directory; zip::read_entry verifies the CRC-32 below).
+static void write_min_plate_zip(const std::filesystem::path& p,
+                                const std::string&           entry,
+                                const std::string&           body)
+{
+    const std::uint32_t crc  = crc32_bytes(body);
+    const std::uint32_t size = static_cast<std::uint32_t>(body.size());
+    const std::uint16_t nlen = static_cast<std::uint16_t>(entry.size());
+    std::string out;
+    auto u16 = [&](std::uint16_t v) {
+        out.push_back(static_cast<char>(v & 0xFF));
+        out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    };
+    auto u32 = [&](std::uint32_t v) {
+        u16(static_cast<std::uint16_t>(v & 0xFFFF));
+        u16(static_cast<std::uint16_t>((v >> 16) & 0xFFFF));
+    };
+    u32(0x04034b50); u16(20); u16(0); u16(0); u16(0); u16(0);
+    u32(crc); u32(size); u32(size); u16(nlen); u16(0);
+    out += entry;
+    out += body;
+    const std::uint32_t cd_off = static_cast<std::uint32_t>(out.size());
+    u32(0x02014b50); u16(20); u16(20); u16(0); u16(0); u16(0); u16(0);
+    u32(crc); u32(size); u32(size); u16(nlen); u16(0); u16(0); u16(0);
+    u16(0); u32(0); u32(0);
+    out += entry;
+    const std::uint32_t cd_size =
+        static_cast<std::uint32_t>(out.size()) - cd_off;
+    u32(0x06054b50); u16(0); u16(0); u16(1); u16(1);
+    u32(cd_size); u32(cd_off); u16(0);
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(out.data(), static_cast<std::streamsize>(out.size()));
+}
+
 // Poll command.get until the receipt leaves "accepted" (worker threads run
 // detached); returns the last observed state, "" on timeout.
 static std::string wait_receipt_state(const std::string& key,
@@ -801,7 +849,7 @@ static void test_commands()
         CHECK(e.v.find("result.error.code").as_string() == "file_changed");
     }
 
-    // --- supply "none": validation + native motion-only subset scan. ---
+    // --- supply "none": validation + container integrity only. ---
     auto none_err = [&](const std::string& key) {
         Envelope g = call(client_op(
             "command.get",
@@ -822,8 +870,6 @@ static void test_commands()
     const std::string kKey12 = "stage3-key-00000012";
     const std::string kKey13 = "stage3-key-00000013";
     const std::string kKey14 = "stage3-key-00000014";
-    const std::string kKey15 = "stage3-key-00000015";
-    const std::string kKey16 = "stage3-key-00000016";
 
     // Non-empty materials and a true calibration option reject at
     // validation (schema: empty materials, options all false).
@@ -841,84 +887,45 @@ static void test_commands()
     e = submit_none(kKey10, "C:/none/x.3mf", true);
     CHECK(err_code(e) == "invalid_request");
 
-    // Existing payload path (wrong hash): a conforming motion-only scan
-    // passes and the receipt fails at the hash check as file_changed.
     std::string paypath = (cdir / "payload.gcode").string();
     for (char& c : paypath)
         if (c == '\\') c = '/';
-    auto write_gcode = [&](const char* name, const char* body) {
-        std::ofstream f(cdir / name, std::ios::binary | std::ios::trunc);
-        f << body;
-    };
-    write_gcode("motion_ok.gcode",
-                "G1 X10 Y10 F3000\nG1 E-2 F1800\nG4 P100\nM400\n"
-                "N12 G1 X0 Y0 F3000\nG28 Y\nM17\nM17 Z0.4\nM73 P0 R11\n"
-                "M104 S0\nM140 S0\nM106 S0\nM18 X Y Z\nG90;\nG91;\n"
-                "; comment only\n");
-    obn::queue::test_set_none_gcode_override(
-        (cdir / "motion_ok.gcode").string());
-    e = submit_none(kKey11, paypath, false);
+
+    // A valid container (the plate gcode entry the printer extracts)
+    // passes the container check and fails only at the byte check, as
+    // file_changed: the sha0 above is wrong for these bytes.
+    std::string zipok = (cdir / "plate_ok.3mf").string();
+    for (char& c : zipok)
+        if (c == '\\') c = '/';
+    write_min_plate_zip(cdir / "plate_ok.3mf", "Metadata/plate_1.gcode",
+                        "G1 X10 Y10 F3000\n");
+    e = submit_none(kKey11, zipok, false);
     CHECK(ok(e));
     CHECK(wait_receipt_state(kKey11, scope, 5000) == "failed");
     CHECK(none_err(kKey11) == "file_changed");
 
-    // Positive extrusion -> unsafe_gcode before any dispatch.
-    write_gcode("motion_e.gcode", "G1 X10 Y10 F3000\nG1 E5 F2100\n");
-    obn::queue::test_set_none_gcode_override((cdir / "motion_e.gcode").string());
+    // An existing non-archive and an archive without this plate's entry
+    // fail the container check closed (content is never inspected).
     e = submit_none(kKey12, paypath, false);
     CHECK(ok(e));
     CHECK(wait_receipt_state(kKey12, scope, 5000) == "failed");
     CHECK(none_err(kKey12) == "unsafe_gcode");
 
-    // Heater, tool change and unknown macro fail closed.
-    write_gcode("motion_hot.gcode", "M104 S210\n");
-    obn::queue::test_set_none_gcode_override((cdir / "motion_hot.gcode").string());
-    e = submit_none(kKey13, paypath, false);
+    std::string zipp2 = (cdir / "plate_only2.3mf").string();
+    for (char& c : zipp2)
+        if (c == '\\') c = '/';
+    write_min_plate_zip(cdir / "plate_only2.3mf", "Metadata/plate_2.gcode",
+                        "G1 X10 Y10 F3000\n");
+    e = submit_none(kKey13, zipp2, false);
     CHECK(ok(e));
     CHECK(wait_receipt_state(kKey13, scope, 5000) == "failed");
     CHECK(none_err(kKey13) == "unsafe_gcode");
 
-    write_gcode("motion_tool.gcode", "T0\n");
-    obn::queue::test_set_none_gcode_override((cdir / "motion_tool.gcode").string());
-    e = submit_none(kKey14, paypath, false);
+    // An unreadable archive fails closed the same way.
+    e = submit_none(kKey14, "C:/obn-no-such/no.gcode", false);
     CHECK(ok(e));
     CHECK(wait_receipt_state(kKey14, scope, 5000) == "failed");
     CHECK(none_err(kKey14) == "unsafe_gcode");
-
-    write_gcode("motion_macro.gcode", "M900 K0.44\n");
-    obn::queue::test_set_none_gcode_override((cdir / "motion_macro.gcode").string());
-    e = submit_none(kKey15, paypath, false);
-    CHECK(ok(e));
-    CHECK(wait_receipt_state(kKey15, scope, 5000) == "failed");
-    CHECK(none_err(kKey15) == "unsafe_gcode");
-
-    // Override off: an unreadable archive fails closed as unsafe_gcode.
-    obn::queue::test_set_none_gcode_override("");
-    e = submit_none(kKey16, "C:/obn-no-such/no.gcode", false);
-    CHECK(ok(e));
-    CHECK(wait_receipt_state(kKey16, scope, 5000) == "failed");
-    CHECK(none_err(kKey16) == "unsafe_gcode");
-
-    // Non-zero heater target, the inventory items still pending review
-    // and ambiguous syntax all stay rejected (PR #7 review).
-    struct { const char* name; const char* body; const char* key; } rej[] = {
-        {"motion_heat.gcode", "M104 S200\n", "stage3-key-00000017"},
-        {"motion_fan.gcode", "M106 S255\n", "stage3-key-00000018"},
-        {"motion_limit.gcode", "M203 X300\n", "stage3-key-00000019"},
-        {"motion_prop.gcode", "M1002 set_filament_type:PLA\n",
-         "stage3-key-00000020"},
-        {"motion_ambig.gcode", ":G1 Y-2 F20000\n", "stage3-key-00000021"},
-    };
-    for (const auto& r : rej) {
-        write_gcode(r.name, r.body);
-        obn::queue::test_set_none_gcode_override(
-            (cdir / r.name).string());
-        e = submit_none(r.key, paypath, false);
-        CHECK(ok(e));
-        CHECK(wait_receipt_state(r.key, scope, 5000) == "failed");
-        CHECK(none_err(r.key) == "unsafe_gcode");
-    }
-    obn::queue::test_set_none_gcode_override("");
 
     // Both worker failures released the kDev2 lane: a fresh key accepts.
     obn::queue::test_set_dispatch_enabled(false);

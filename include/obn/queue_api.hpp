@@ -43,9 +43,6 @@ void test_set_command_session(const std::string& user_id,
                               const std::string& config_dir);
 void test_clear_command_session();
 void test_set_dispatch_enabled(bool enabled);
-// Test-only: point the supply "none" motion-only scan at a plain text
-// file instead of parsing the submitted 3MF (empty string disables).
-void test_set_none_gcode_override(const std::string& path);
 #endif
 
 } // namespace obn::queue
