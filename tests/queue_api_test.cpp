@@ -852,8 +852,9 @@ static void test_commands()
     };
     write_gcode("motion_ok.gcode",
                 "G1 X10 Y10 F3000\nG1 E-2 F1800\nG4 P100\nM400\n"
-                "N12 G1 X0 Y0 F3000\nG28\nM17\nM73 P50\nM104 S0\nM140 S0\n"
-                "M18\n; comment only\n");
+                "N12 G1 X0 Y0 F3000\nG28 Y\nM17\nM17 Z0.4\nM73 P0 R11\n"
+                "M104 S0\nM140 S0\nM106 S0\nM18 X Y Z\nG90;\nG91;\n"
+                "; comment only\n");
     obn::queue::test_set_none_gcode_override(
         (cdir / "motion_ok.gcode").string());
     e = submit_none(kKey11, paypath, false);

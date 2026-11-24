@@ -1159,9 +1159,10 @@ bool m73_words(const std::string& line, std::size_t from)
     }
 }
 
-// M104/M140 accept exactly one word: S with value 0 (heater off). No
-// target, a non-numeric target or any trailing word fails closed.
-bool heater_off_words(const std::string& line, std::size_t from)
+// M104/M140/M106 accept exactly one word: S with value 0 (heater or fan
+// off; the only forms observed in the kit archive). No target, a
+// non-numeric target or any trailing word fails closed.
+bool sole_s0_words(const std::string& line, std::size_t from)
 {
     const GWord w = gword(line, from);
     if (w.b == w.e) return false;
@@ -1182,6 +1183,8 @@ const char* gcode_motion_only(const std::string& text)
         std::string line = text.substr(pos, nl - pos);
         pos = nl + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t semi = line.find(';'); // comment to end of line
+        if (semi != std::string::npos) line.erase(semi);
         const std::size_t star = line.find('*'); // trailing checksum
         if (star != std::string::npos) line.erase(star);
 
@@ -1195,7 +1198,7 @@ const char* gcode_motion_only(const std::string& text)
             word = ascii_upper(line.substr(w.b, w.e - w.b));
         }
         if (word.empty()) continue;
-        if (word[0] == ';' || word[0] == '(') continue;
+        if (word[0] == '(') continue;
 
         if (word == "G0" || word == "G1" || word == "G2" || word == "G3") {
             if (has_positive_e(line, w.e)) return "positive extrusion move";
@@ -1216,16 +1219,15 @@ const char* gcode_motion_only(const std::string& text)
             if (!m73_words(line, w.e)) return "unsupported M73 argument";
             continue;
         }
-        if (word == "M104" || word == "M140") {
-            if (!heater_off_words(line, w.e))
-                return "heater target must be S0";
+        if (word == "M104" || word == "M140" || word == "M106") {
+            if (!sole_s0_words(line, w.e)) return "target must be S0";
             continue;
         }
         if (word[0] == 'T') return "tool change command";
         if (word == "M620" || word == "M621" || word == "M600")
             return "filament change command";
         if (word == "M109" || word == "M190" || word == "M141" ||
-            word == "M191" || word == "M106" || word == "M107")
+            word == "M191" || word == "M107")
             return "heater or fan command";
         return "unsupported command";
     }

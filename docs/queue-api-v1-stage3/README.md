@@ -196,20 +196,21 @@ calibration/timelapse/leveling, and native validation of a bounded supported
 G-code subset with no extrusion or filament loading. The implemented subset is an
 allowlist scanned from `Metadata/plate_<plate_index>.gcode` (the same entry the
 printer extracts as `param` from `build_project_file_json`) before dispatch.
+Lines are truncated at `;` comments, and `*` checksums are stripped before parsing.
 Accepted, with bounded or no arguments: `G0`, `G1`, `G2`, `G3` (no positive `E`
 word; a signed negative `E` retract passes, and `E` parameters on non-motion
 lines such as `M201`/`M203`/`M205`/`M1006` are never read as extrusion), `G28`
 and `M17` (bare or `X`/`Y`/`Z` axis words only), `G4`, `G90`, `G91`, `G92`, `M73`
 (finite numeric `P`/`R`/`S` only), `M400`, `M117`, `M84`, `M18`, and `M104`/
-`M140` only as the sole argument `S0`. Everything else fails as `unsafe_gcode`
-before dispatch: positive extrusion, any non-zero heater target, `M109`, `M190`,
-`M141`, `M191`, `M106`, `M107`, the machine limit writes `M201`, `M203`, `M204`,
-`M205`, the proprietary `G380`, `G392`, `M9833.2`, `M1002`, `M1006`, filament
-change (`M620`, `M621`, `M600`), `T` words, ambiguous syntax such as a leading
-colon, and any command outside the allowlist; an unverifiable archive or plate
-fails the same way. Mere user labeling or empty mapping is not proof. The
-pending commands and firmware constraints stay open for review. This is a print
-capability, not a special plate-changer API.
+`M140`/`M106` only as the sole argument `S0`. Everything else fails as
+`unsafe_gcode` before dispatch: positive extrusion, any non-zero `S` target on
+`M104`/`M140`/`M106`, `M109`, `M190`, `M141`, `M191`, `M107`, the machine limit
+writes `M201`, `M203`, `M204`, `M205`, the proprietary `G380`, `G392`, `M9833.2`,
+`M1002`, `M1006`, filament change (`M620`, `M621`, `M600`), `T` words, ambiguous
+syntax such as a leading colon, and any command outside the allowlist; an
+unverifiable archive or plate fails the same way. Mere user labeling or empty
+mapping is not proof. The pending commands and firmware constraints stay open
+for review. This is a print capability, not a special plate-changer API.
 
 Automatic sequencing requires matched, quiescent `completed` evidence with error 0,
 then a fresh available/idle, fault-free printer check. Failed/cancelled jobs do not
