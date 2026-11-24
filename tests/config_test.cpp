@@ -308,6 +308,30 @@ static int test_version_override()
     return 0;
 }
 
+static int test_native_narrow()
+{
+#ifdef _WIN32
+    // Issue #28: UTF-8 profile dirs must decode to the real characters via
+    // the ANSI code page. Raw bytes fed to MSVC's path() would instead read
+    // as ANSI: UTF-8 "å" (C3 A5) becomes "Ã¥" and files land in a mojibake
+    // sibling folder.
+    const std::string utf8 = "C:\\Users\\User\xC3\xA5\\OrcaSlicer";
+    const std::string nat  = obn::config::native_narrow(utf8);
+    const std::wstring wide = fs::path(nat).wstring();
+    CHECK(wide.find(static_cast<wchar_t>(0x00E5)) != std::wstring::npos);
+    CHECK(wide.find(static_cast<wchar_t>(0x00C3)) == std::wstring::npos);
+
+    // Already-ANSI bytes (invalid UTF-8) pass through untouched.
+    const std::string ansi = "C:\\Users\\User\xE5\\OrcaSlicer";
+    CHECK(obn::config::native_narrow(ansi) == ansi);
+#else
+    // POSIX file APIs are byte-transparent.
+    CHECK(obn::config::native_narrow("/home/user/\xC3\xA5") ==
+          "/home/user/\xC3\xA5");
+#endif
+    return 0;
+}
+
 int main()
 {
     if (test_parse_keys() != 0) return 1;
@@ -322,6 +346,7 @@ int main()
     if (test_cloud_mqtt_port_bounds() != 0) return 1;
     if (test_mytask_pop_values() != 0) return 1;
     if (test_version_override() != 0) return 1;
+    if (test_native_narrow() != 0) return 1;
 
     {
         const fs::path dir = make_temp_dir();

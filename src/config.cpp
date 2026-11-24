@@ -17,6 +17,13 @@
 #include <string_view>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace obn::config {
 namespace {
 
@@ -512,6 +519,37 @@ std::string path_in_dir(const std::string& basename)
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_config_dir.empty()) return {};
     return (std::filesystem::path(g_config_dir) / basename).string();
+}
+
+std::string native_narrow(const std::string& utf8)
+{
+#ifdef _WIN32
+    // Studio hands config_dir/log_dir over the ABI as UTF-8 (wx ToUTF8), but
+    // MSVC's std::filesystem::path and fopen read the ANSI code page, so the
+    // bytes used directly build a mojibake sibling directory (issue #28:
+    // "C:\Users\Userå" read as "C:\Users\UserÃ¥"). Decode as UTF-8, re-encode
+    // as ANSI, so every file API below agrees on one encoding. Invalid UTF-8
+    // passes through unchanged (the caller already handed ANSI bytes).
+    if (utf8.empty()) return utf8;
+    const int wlen = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                           utf8.data(),
+                                           static_cast<int>(utf8.size()),
+                                           nullptr, 0);
+    if (wlen <= 0) return utf8;
+    std::wstring wide(static_cast<std::size_t>(wlen), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+                          static_cast<int>(utf8.size()), wide.data(), wlen);
+    const int alen = ::WideCharToMultiByte(CP_ACP, 0, wide.data(), wlen,
+                                           nullptr, 0, nullptr, nullptr);
+    if (alen <= 0) return utf8;
+    std::string out(static_cast<std::size_t>(alen), '\0');
+    ::WideCharToMultiByte(CP_ACP, 0, wide.data(), wlen, out.data(), alen,
+                          nullptr, nullptr);
+    return out;
+#else
+    // POSIX file APIs are byte-transparent and Orca already passes UTF-8.
+    return utf8;
+#endif
 }
 
 std::string read_version_override(const std::string& dir)

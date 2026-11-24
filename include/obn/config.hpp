@@ -223,6 +223,12 @@ const std::string& dir();
 // Windows.
 std::string path_in_dir(const std::string& basename);
 
+// UTF-8 path argument from the slicer (wx ToUTF8 / PEP 529 fsencode) ->
+// ANSI code page bytes, the encoding std::filesystem::path and fopen read on
+// Windows. Without this a non-ASCII profile dir lands in a mojibake sibling
+// folder (issue #28). Invalid UTF-8 passes through unchanged; POSIX: identity.
+std::string native_narrow(const std::string& utf8);
+
 // True when `region` names the Chinese cloud ("CN"/"cn"), else global.
 bool is_cn_region(const std::string& region);
 

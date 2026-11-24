@@ -18,6 +18,13 @@ std::string g_log_start_time;
 
 OBN_ABI void* bambu_network_create_agent(std::string log_dir)
 {
+    // Studio's data_dir crosses the ABI as UTF-8 while every file API below
+    // reads the ANSI code page, so without this a profile dir like
+    // C:\Users\Userå builds and reads a mojibake sibling folder (issue #28).
+    // Convert before the first path is built; the banner keeps the original
+    // bytes because obn.log is decoded as UTF-8.
+    const std::string log_dir_utf8 = log_dir;
+    log_dir = obn::config::native_narrow(log_dir);
     const auto cfg = obn::config::load_or_create(log_dir);
     obn::log::apply_config(cfg);
     // Optional file sink: OBN_LOG_TO_FILE=1 or log_to_file=1 in obn.conf
@@ -36,7 +43,7 @@ OBN_ABI void* bambu_network_create_agent(std::string log_dir)
     constexpr const char* k_plugin_version = "unknown";
 #endif
     OBN_INFO("create_agent log_dir=%s  plugin_version=%s",
-             log_dir.c_str(), k_plugin_version);
+             log_dir_utf8.c_str(), k_plugin_version);
     obn::openssl_host_check::log_once();
     try {
         return new Agent(std::move(log_dir));
@@ -68,6 +75,8 @@ OBN_ABI int bambu_network_init_log(void* /*agent*/)
 OBN_ABI int bambu_network_set_config_dir(void* agent, std::string config_dir)
 {
     OBN_DEBUG("set_config_dir %s", config_dir.c_str());
+    // UTF-8 in, ANSI out: file APIs read the ANSI code page (issue #28).
+    config_dir = obn::config::native_narrow(config_dir);
     if (auto* a = as_agent(agent)) {
         a->set_config_dir(std::move(config_dir));
         return BAMBU_NETWORK_SUCCESS;
@@ -78,6 +87,9 @@ OBN_ABI int bambu_network_set_config_dir(void* agent, std::string config_dir)
 OBN_ABI int bambu_network_set_cert_file(void* agent, std::string folder, std::string filename)
 {
     OBN_DEBUG("set_cert_file folder=%s filename=%s", folder.c_str(), filename.c_str());
+    // UTF-8 in, ANSI out: file APIs read the ANSI code page (issue #28).
+    folder = obn::config::native_narrow(folder);
+    filename = obn::config::native_narrow(filename);
     if (auto* a = as_agent(agent)) {
         a->set_cert_file(std::move(folder), std::move(filename));
         return BAMBU_NETWORK_SUCCESS;
