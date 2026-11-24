@@ -1251,6 +1251,7 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/auth.cpp
         src/camera_url.cpp
         src/cert_store.cpp
+        src/cloud_print.cpp
         src/config.cpp
         src/cloud_auth.cpp
         src/cloud_presets.cpp
@@ -1267,6 +1268,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
         src/lan_tls.cpp
         src/log.cpp
         src/mqtt_client.cpp
+        src/print_job.cpp
+        src/print_job_naming.cpp
         src/print_params_ftp_prefs.cpp
         src/os_compat.cpp
         src/queue_api.cpp
