@@ -1338,18 +1338,22 @@ void Agent::harvest_security_flags(const std::string& dev_id,
     const auto& f3 = root->find("print.flag3");
     if (!f3.is_number()) return;
 
-    // Bit 16 = new authorization-control system enabled (reverse-networking
-    // "5. MQTT.md"). Latch it once true; never clear so an incremental frame
-    // that omits the bit doesn't undo a prior pushall.
+    // Bit 16 is A/P-series multi-color external change assist
+    // (OrcaSlicer DeviceManager.hpp:592, "for A/P series"), set on every
+    // A/P-series printer — it says nothing about firmware security
+    // (ClusterM/open-bamboo-networking#162). We keep it only as a cheap
+    // per-device "A/P-series present" hook for the signing-material check
+    // below: latch once true, never clear, so an incremental frame that
+    // omits the bit doesn't undo a prior pushall.
     const bool supported = ((f3.as_int() >> 16) & 1) != 0;
     if (!supported) return;
     std::lock_guard<std::mutex> lk(mu_);
     bool& latched = sec_new_auth_by_dev_[dev_id];
     if (!latched) {
         latched = true;
-        OBN_INFO("dev=%s advertises new authorization-control system "
-                 "(flag3 bit16)", dev_id.c_str());
-        // First sight of a secured printer: make sure we actually hold
+        OBN_INFO("dev=%s: flag3 bit16 (A/P-series external change assist), "
+                 "verifying app signing material", dev_id.c_str());
+        // First sight of an A/P-series printer: make sure we actually hold
         // signing material for it (issue #2 — unsigned prints to a secured
         // printer are rejected with 84033543). Fetch runs detached; mu_ is
         // held but the worker only takes mu_ after fetch_and_store returns.

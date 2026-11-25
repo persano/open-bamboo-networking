@@ -219,9 +219,9 @@ public:
     // app_certs_by_dev_. Returns false on publish failure.
     bool request_app_cert_list(const std::string& dev_id);
 
-    // True once the printer has advertised the new authorization-control
-    // system (print.flag3 bit 16) in a push_status frame. Latched by
-    // harvest_security_flags().
+    // True once a push_status frame carried print.flag3 bit 16 (A/P-series
+    // external change assist — a presence hook, not a security signal,
+    // see #162). Latched by harvest_security_flags().
     bool printer_supports_new_auth(const std::string& dev_id) const;
 
     // Fire-and-forget app_cert_install when slicer_app_cert_usable().
@@ -503,9 +503,10 @@ private:
     void harvest_security_report(const std::string& dev_id,
                                  const std::string& json);
 
-    // Scans a push_status frame for print.flag3 and latches whether the
-    // printer supports the new authorization-control system (bit 16). Cheap
-    // substring prefilter; full JSON parse only on candidate frames.
+    // Scans a push_status frame for print.flag3 and latches bit 16 (A/P-series
+    // external change assist — presence hook only, not a security signal,
+    // see #162). Cheap substring prefilter; full JSON parse only on candidate
+    // frames.
     void harvest_security_flags(const std::string& dev_id,
                                 const std::string& json);
 
