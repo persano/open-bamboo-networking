@@ -1131,7 +1131,12 @@ if(OBN_BUILD_TESTS)
         target_link_libraries(receipt_store_test PRIVATE ws2_32)
     endif()
     add_test(NAME receipt_store COMMAND receipt_store_test)
-    set_tests_properties(receipt_store PROPERTIES TIMEOUT 60)
+    # I/O bound by design: the capacity case performs 4096 reserves, each a
+    # lock + append + fflush + fsync, so wall time tracks runner disk load.
+    # 60s passed in run 45499268097 but timed out in 45542457477 on an
+    # otherwise identical tree (7.7s locally); 180s keeps hang detection
+    # while tolerating a loaded shared runner.
+    set_tests_properties(receipt_store PROPERTIES TIMEOUT 180)
 endif()
 if(OBN_BUILD_TESTS AND NOT WIN32)
 
