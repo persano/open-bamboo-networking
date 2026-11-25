@@ -1,4 +1,5 @@
 #include "obn/zip_read.hpp"
+#include "obn/os_compat.hpp"
 
 #include <zlib.h>
 
@@ -80,7 +81,8 @@ bool read_entry(const std::string&         zip_path,
                 std::string*               err)
 {
     if (!out) return fail(err, "no output buffer");
-    std::ifstream f(zip_path, std::ios::binary | std::ios::ate);
+    std::ifstream f(obn::os::open_path(zip_path),
+                    std::ios::binary | std::ios::ate);
     if (!f) return fail(err, "cannot open archive");
     const std::streamoff end = f.tellg();
     if (end < static_cast<std::streamoff>(kEocdLen)) {

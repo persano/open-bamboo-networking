@@ -32,6 +32,7 @@ namespace obn::cloud_print {
                                      const std::string& profile_id,
                                      bool use_lan_channel);
     std::string test_md5_file_hex_upper(const std::string& path);
+    std::string test_slurp_file(const std::string& path, std::string* err);
     bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs,
                                const std::string& region);
     bool test_should_retry_mytask_pop(int status_code, bool pop_attached);
@@ -831,6 +832,28 @@ static void test_md5_file_hex_upper_matches_stock_style()
     CHECK(obn::cloud_print::test_md5_file_hex_upper(path.string()).empty());
 }
 
+// UTF-8 file paths: a narrow ifstream open reads the ANSI code page and
+// misses non-ACP names entirely, so md5/slurp must open through
+// os::open_path (u8path + \\?\ prefix).
+static void test_utf8_file_paths()
+{
+    const auto path = std::filesystem::temp_directory_path() /
+                      std::filesystem::u8path(
+                          "obn-md5-\xe6\xb5\x8b\xe8\xaf\x95\xf0\x9f\x8c\xb8"
+                          "-plate.3mf");
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "hello";
+    }
+    const std::string u8 = path.u8string();
+    CHECK(obn::cloud_print::test_md5_file_hex_upper(u8)
+          == "5D41402ABC4B2A76B9719D911017C592");
+    std::string err;
+    CHECK(obn::cloud_print::test_slurp_file(u8, &err) == "hello");
+    std::filesystem::remove(path);
+    CHECK(obn::cloud_print::test_md5_file_hex_upper(u8).empty());
+}
+
 // ---------------------------------------------------------------------------
 // mytask_pop: PoP headers on POST /my/task (default = on in every region)
 // ---------------------------------------------------------------------------
@@ -1219,6 +1242,7 @@ int main()
 
     test_format_upload_info_matches_stock();
     test_md5_file_hex_upper_matches_stock_style();
+    test_utf8_file_paths();
 
     // Runs last: these load obn.conf into the process-global config.
     test_mytask_pop_default_on();

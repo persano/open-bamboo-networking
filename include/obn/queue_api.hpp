@@ -43,6 +43,11 @@ void test_set_command_session(const std::string& user_id,
                               const std::string& config_dir);
 void test_clear_command_session();
 void test_set_dispatch_enabled(bool enabled);
+// Parse a full print command and return the flat / snake / detail
+// mapping strings build_print_params would set (no Agent, no store).
+bool test_build_mapping(const std::string& cmd_json, std::string* flat,
+                        std::string* snake, std::string* detail,
+                        std::string* err);
 #endif
 
 } // namespace obn::queue

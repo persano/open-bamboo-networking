@@ -631,7 +631,8 @@ std::string Client::stor(const std::string& local_path,
                          const std::string& remote_path,
                          ProgressFn         progress)
 {
-    std::ifstream f(local_path, std::ios::binary | std::ios::ate);
+    std::ifstream f(obn::os::open_path(local_path),
+                    std::ios::binary | std::ios::ate);
     if (!f) return "open " + local_path + ": " + std::strerror(errno);
     std::uint64_t total = static_cast<std::uint64_t>(f.tellg());
     f.seekg(0, std::ios::beg);

@@ -18,6 +18,7 @@
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
+#include "obn/os_compat.hpp"
 #include "obn/receipt_store.hpp"
 #include "obn/zip_read.hpp"
 
@@ -1040,7 +1041,7 @@ std::string sha256_hex(const std::string& data)
 // sets *exists=false when the file cannot be opened at all.
 std::string sha256_file_hex(const std::string& path, bool* exists)
 {
-    std::ifstream in(path, std::ios::binary);
+    std::ifstream in(os::open_path(path), std::ios::binary);
     if (!in) {
         if (exists) *exists = false;
         return {};
@@ -1575,30 +1576,72 @@ bool parse_command(const json::Value& cmd, SubmitCommand* out,
 
 // materials -> per-source-id slot values: index = sliced source filament
 // id, value = linear AMS slot (ams*4+tray) or -1 for external. Sparse
-// ids are not list positions (contract): holes stay -1.
+// ids are not list positions (contract): holes stay -1. `present` marks
+// the indices carrying a material, which is what separates a real
+// external selection from an unused project filament. *detail is the
+// legacy amsDetailMapping array: one element per project filament in
+// SelectMachine's get_ams_mapping_result shape (holes ship ams -1 with
+// empty strings and no sourceColor key).
 bool build_mapping_values(const SubmitCommand& sc, std::vector<int>* vals,
+                          std::vector<char>* present, std::string* detail,
                           std::string* err)
 {
-    int                 max_id = -1;
-    std::map<int, int>  by_id;
+    int max_id = -1;
+    std::map<int, std::pair<int, const json::Object*>> by_id;
     for (const auto& m : sc.materials.as_array()) {
-        const std::string sid = gv(m.as_object(), "source_filament_id").as_string();
-        const int         id  = std::atoi(sid.c_str());
-        int               v   = -1;
+        const json::Object& mo  = m.as_object();
+        const std::string   sid = gv(mo, "source_filament_id").as_string();
+        const int           id  = std::atoi(sid.c_str());
+        int                 v   = -1;
         if (sc.supply == "ams") {
             int ams = 0, tray = 0;
-            if (!parse_slot_id(gv(m.as_object(), "slot_id").as_string(), &ams, &tray)) {
-                *err = "invalid slot_id: " + gv(m.as_object(), "slot_id").as_string();
+            if (!parse_slot_id(gv(mo, "slot_id").as_string(), &ams, &tray)) {
+                *err = "invalid slot_id: " + gv(mo, "slot_id").as_string();
                 return false;
             }
             v = ams * 4 + tray;
         }
-        by_id[id] = v;
+        by_id[id] = {v, &mo};
         if (id > max_id) max_id = id;
     }
-    vals->assign(static_cast<std::size_t>(max_id + 1), -1);
-    for (const auto& kv : by_id)
-        (*vals)[static_cast<std::size_t>(kv.first)] = kv.second;
+    const std::size_t n = static_cast<std::size_t>(max_id + 1);
+    vals->assign(n, -1);
+    present->assign(n, 0);
+    for (const auto& kv : by_id) {
+        (*vals)[static_cast<std::size_t>(kv.first)] = kv.second.first;
+        (*present)[static_cast<std::size_t>(kv.first)] = 1;
+    }
+
+    // Detail element: filamentId carries profile_id (the preset filament
+    // id the consumer sends), colors drop the leading '#', key order
+    // follows the legacy bridge fixture.
+    auto bare = [](std::string c) {
+        if (!c.empty() && c[0] == '#') c.erase(0, 1);
+        return c;
+    };
+    std::string d = "[";
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i) d += ',';
+        const auto it = by_id.find(static_cast<int>(i));
+        if (it == by_id.end()) {
+            d += "{\"ams\":-1,\"targetColor\":\"\","
+                 "\"filamentId\":\"\",\"filamentType\":\"\"}";
+            continue;
+        }
+        const json::Object& mo = *it->second.second;
+        // json::escape adds the surrounding quotes itself.
+        d += "{\"ams\":" + std::to_string((*vals)[i]);
+        d += ",\"targetColor\":" +
+             json::escape(bare(gv(mo, "target_color").as_string()));
+        d += ",\"filamentId\":" +
+             json::escape(gv(mo, "profile_id").as_string());
+        d += ",\"filamentType\":" +
+             json::escape(gv(mo, "type").as_string());
+        d += ",\"sourceColor\":" +
+             json::escape(bare(gv(mo, "source_color").as_string()));
+        d += "}";
+    }
+    *detail = d + "]";
     return true;
 }
 
@@ -1613,18 +1656,24 @@ std::string flat_mapping_json(const std::vector<int>& vals)
 }
 
 // Snake_case ams_mapping2 the way the printer's MQTT schema wants it
-// (PrintParams::ams_mapping2 is passed verbatim on the LAN path);
-// -1/external maps to the {255,0} sentinel, same as the cloud
-// conversion in cloud_print.cpp.
-std::string snake_mapping2_json(const std::vector<int>& vals)
+// (PrintParams::ams_mapping2 is passed verbatim on the LAN path and
+// re-keyed to camelCase for the cloud). Legacy stock-bridge rule: a
+// real external selection is the {255,0} sentinel, an unused project
+// filament is {255,255} -- a sparse plate must not turn its holes into
+// external-spool selections.
+std::string snake_mapping2_json(const std::vector<int>& vals,
+                                const std::vector<char>& present)
 {
     std::string s     = "[";
     bool        first = true;
-    for (const int v : vals) {
+    for (std::size_t i = 0; i < vals.size(); ++i) {
         if (!first) s += ',';
         first       = false;
-        const int ams  = v < 0 ? 255 : v / 4;
-        const int slot = v < 0 ? 0 : v % 4;
+        const int v = vals[i];
+        int ams, slot;
+        if (v >= 0)          { ams = v / 4;     slot = v % 4;  }
+        else if (present[i]) { ams = 255;       slot = 0;      }
+        else                 { ams = 255;       slot = 255;    }
         s += "{\"ams_id\":" + std::to_string(ams) +
              ",\"slot_id\":" + std::to_string(slot) + "}";
     }
@@ -1649,8 +1698,10 @@ bool slots_present(const json::Value& print_v, const json::Value& materials)
 bool build_print_params(const SubmitCommand& sc, Agent* a, BBL::PrintParams* p,
                         std::string* err)
 {
-    std::vector<int> vals;
-    if (!build_mapping_values(sc, &vals, err)) return false;
+    std::vector<int>  vals;
+    std::vector<char> present;
+    std::string       detail;
+    if (!build_mapping_values(sc, &vals, &present, &detail, err)) return false;
 
     *p                    = BBL::PrintParams{};
     p->dev_id             = sc.device_id;
@@ -1679,7 +1730,8 @@ bool build_print_params(const SubmitCommand& sc, Agent* a, BBL::PrintParams* p,
     p->auto_flow_cali    = sc.flow_calibration ? 1 : 0;
     p->auto_offset_cali  = 0;
     p->ams_mapping  = flat_mapping_json(vals);
-    p->ams_mapping2 = snake_mapping2_json(vals);
+    p->ams_mapping2 = snake_mapping2_json(vals, present);
+    p->ams_mapping_info = detail;
     return true;
 }
 
@@ -2768,6 +2820,28 @@ void test_clear_command_session()
 void test_set_dispatch_enabled(bool enabled)
 {
     g_test_dispatch_on = enabled;
+}
+
+// Mapping builders without a live Agent: parse a full print command
+// and return the three mapping strings build_print_params would set.
+bool test_build_mapping(const std::string& cmd_json, std::string* flat,
+                        std::string* snake, std::string* detail,
+                        std::string* err)
+{
+    auto parsed = obn::json::parse(cmd_json);
+    if (!parsed) {
+        *err = "invalid command JSON";
+        return false;
+    }
+    SubmitCommand sc;
+    const char*   code = "invalid_request";
+    if (!parse_command(*parsed, &sc, err, &code)) return false;
+    std::vector<int>  vals;
+    std::vector<char> present;
+    if (!build_mapping_values(sc, &vals, &present, detail, err)) return false;
+    *flat  = flat_mapping_json(vals);
+    *snake = snake_mapping2_json(vals, present);
+    return true;
 }
 #endif
 

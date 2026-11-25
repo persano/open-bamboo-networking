@@ -29,6 +29,8 @@
 
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
+#include <string>
 
 namespace obn::os {
 
@@ -108,5 +110,30 @@ int poll_one(socket_t s, short events, int timeout_ms, short* out_revents = null
 
 // shutdown(SD_BOTH) / shutdown(SHUT_RDWR). No-op on kInvalidSocket.
 void shutdown_both(socket_t s);
+
+// UTF-8 bytes -> a std::filesystem::path that opens the intended file
+// on Windows. u8path decodes UTF-8 (a narrow open reads the ANSI code
+// page and misses non-ACP names, issue #28) and the \\?\ prefix lifts
+// the 260-char MAX_PATH limit. \\?\ accepts backslashes only, so
+// make_preferred first; UNC roots need the \\?\UNC\ form. Relative
+// paths stay unprefixed (the prefix requires an absolute path).
+// shortcut: relative paths longer than MAX_PATH are not prefixed,
+// upgrade when a consumer reports one.
+inline std::filesystem::path open_path(const std::string& utf8)
+{
+#ifdef _WIN32
+    std::filesystem::path p = std::filesystem::u8path(utf8);
+    p.make_preferred();
+    const std::wstring w = p.wstring();
+    if (w.rfind(L"\\\\?\\", 0) == 0) return p;
+    if (w.rfind(L"\\\\", 0) == 0)
+        return std::filesystem::path(L"\\\\?\\UNC\\" + w.substr(2));
+    if (p.is_absolute())
+        return std::filesystem::path(L"\\\\?\\" + w);
+    return p;
+#else
+    return std::filesystem::path(utf8);
+#endif
+}
 
 } // namespace obn::os

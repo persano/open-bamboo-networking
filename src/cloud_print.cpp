@@ -35,6 +35,7 @@
 #include "obn/signing.hpp"
 #include "obn/cloud_auth.hpp"
 #include "obn/config.hpp"
+#include "obn/os_compat.hpp"
 #include "obn/http_client.hpp"
 #include "obn/json_lite.hpp"
 #include "obn/log.hpp"
@@ -106,7 +107,7 @@ std::string redact_url(const std::string& url)
 // of obn::http::Request, not chunking here.
 std::string slurp_file(const std::string& path, std::string* err)
 {
-    std::ifstream ifs(path, std::ios::binary);
+    std::ifstream ifs(os::open_path(path), std::ios::binary);
     if (!ifs) {
         if (err) *err = "open failed";
         return {};
@@ -127,7 +128,7 @@ std::string slurp_file(const std::string& path, std::string* err)
 // stock never does; see stock_hybrid.mitm 2026-07-19.
 std::string md5_file_hex_upper(const std::string& path)
 {
-    std::ifstream ifs(path, std::ios::binary);
+    std::ifstream ifs(os::open_path(path), std::ios::binary);
     if (!ifs) return {};
 
     std::unique_ptr<EVP_MD_CTX, void(*)(EVP_MD_CTX*)> ctx(
@@ -870,6 +871,8 @@ std::string test_build_task_body(const BBL::PrintParams& p,
     { return build_task_body(p, project_id, model_id, profile_id, use_lan_channel); }
 std::string test_md5_file_hex_upper(const std::string& path)
     { return md5_file_hex_upper(path); }
+std::string test_slurp_file(const std::string& path, std::string* err)
+    { return slurp_file(path, err); }
 bool test_apply_mytask_pop(std::map<std::string, std::string>& hdrs,
                            const std::string& region)
     { return apply_mytask_pop(hdrs, region); }

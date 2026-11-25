@@ -9,6 +9,7 @@
 #include "obn/obn_queue_api_v1.h"
 #include "obn/queue_api.hpp"
 #include "obn/json_lite.hpp"
+#include "obn/os_compat.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -541,6 +542,91 @@ static void test_read_text_file()
     fs::remove(p, ec);
 }
 
+// Full print command JSON for the mapping-shape checks below.
+static std::string map_cmd(const std::string& supply,
+                           const std::string& materials)
+{
+    return "{\"kind\":\"print\",\"device_id\":\"01P00C490800259\","
+           "\"payload\":{\"file\":{\"path\":\"C:/map.3mf\",\"sha256\":\"" +
+           std::string(64, '0') +
+           "\",\"plate_index\":1},\"task_tag\":\"map\","
+           "\"supply\":\"" + supply + "\",\"materials\":" + materials +
+           ",\"options\":{\"bed_leveling\":false,"
+           "\"flow_calibration\":false,\"timelapse\":false}}}";
+}
+
+// Legacy mapping shapes (ChenLei's stock-bridge compare fixtures): one
+// amsDetailMapping element per project filament, holes stay -1 in the
+// flat array and become {255,255} in amsMapping2, with {255,0}
+// reserved for a real external selection.
+static void test_mapping_outputs()
+{
+    std::string flat, snake, detail, err;
+
+    // Real external selection: -1 flat, {255,0} snake, full detail.
+    CHECK(obn::queue::test_build_mapping(
+        map_cmd("external",
+                "[{\"source_filament_id\":\"0\",\"slot_id\":\"external\","
+                "\"type\":\"PETG\",\"profile_id\":\"GFG99\","
+                "\"source_color\":\"#FAFAFAFF\","
+                "\"target_color\":\"#FAFAFAFF\"}]"),
+        &flat, &snake, &detail, &err));
+    CHECK(flat == "[-1]");
+    CHECK(snake == "[{\"ams_id\":255,\"slot_id\":0}]");
+    CHECK(detail ==
+          "[{\"ams\":-1,\"targetColor\":\"FAFAFAFF\","
+          "\"filamentId\":\"GFG99\",\"filamentType\":\"PETG\","
+          "\"sourceColor\":\"FAFAFAFF\"}]");
+
+    // Single AMS tray: flat carries the linear slot ams*4+tray.
+    CHECK(obn::queue::test_build_mapping(
+        map_cmd("ams",
+                "[{\"source_filament_id\":\"0\",\"slot_id\":\"ams-0-slot-3\","
+                "\"type\":\"PETG\",\"profile_id\":\"GFG99\","
+                "\"source_color\":\"#FAFAFAFF\","
+                "\"target_color\":\"#FAFAFAFF\"}]"),
+        &flat, &snake, &detail, &err));
+    CHECK(flat == "[3]");
+    CHECK(snake == "[{\"ams_id\":0,\"slot_id\":3}]");
+    CHECK(detail ==
+          "[{\"ams\":3,\"targetColor\":\"FAFAFAFF\","
+          "\"filamentId\":\"GFG99\",\"filamentType\":\"PETG\","
+          "\"sourceColor\":\"FAFAFAFF\"}]");
+
+    // Sparse plate: only source filament 8 is selected. The 8 leading
+    // holes stay -1 in flat, map to {255,255} (never the external
+    // {255,0}) in snake, and each gets an empty detail element with no
+    // sourceColor key.
+    CHECK(obn::queue::test_build_mapping(
+        map_cmd("ams",
+                "[{\"source_filament_id\":\"8\",\"slot_id\":\"ams-0-slot-3\","
+                "\"type\":\"PETG\",\"profile_id\":\"GFG99\","
+                "\"source_color\":\"#FAFAFAFF\","
+                "\"target_color\":\"#FAFAFAFF\"}]"),
+        &flat, &snake, &detail, &err));
+    CHECK(flat == "[-1,-1,-1,-1,-1,-1,-1,-1,3]");
+    CHECK(snake ==
+          "[{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":255,\"slot_id\":255},"
+          "{\"ams_id\":0,\"slot_id\":3}]");
+    std::string want = "[";
+    for (int i = 0; i < 8; ++i) {
+        if (i) want += ',';
+        want += "{\"ams\":-1,\"targetColor\":\"\","
+                "\"filamentId\":\"\",\"filamentType\":\"\"}";
+    }
+    want += ",{\"ams\":3,\"targetColor\":\"FAFAFAFF\","
+            "\"filamentId\":\"GFG99\",\"filamentType\":\"PETG\","
+            "\"sourceColor\":\"FAFAFAFF\"}]";
+    CHECK(detail == want);
+}
+
 // ---------------------------------------------------------------------------
 // Stage-3 command.submit / command.get / job.get (issue #16): validation,
 // signed-out fail-closed, durable dedup/replay/conflict, lane serialization,
@@ -927,6 +1013,69 @@ static void test_commands()
     CHECK(wait_receipt_state(kKey14, scope, 5000) == "failed");
     CHECK(none_err(kKey14) == "unsafe_gcode");
 
+    // UTF-8 file paths: a narrow open misses non-ACP names and would
+    // fail closed as unsafe_file, so reaching file_changed proves the
+    // wide open (sha256_file_hex / zip::read_entry) found the file.
+    const std::string kKey15 = "stage3-key-00000015";
+    const std::string kKey16 = "stage3-key-00000016";
+    const std::string kKey17 = "stage3-key-00000017";
+    {
+        const fs::path up = cdir / std::filesystem::u8path(
+                              "\xe6\x8d\xa2\xe7\x9b\x98\xf0\x9f\x8c\xb8.gcode");
+        {
+            std::ofstream f(up, std::ios::binary | std::ios::trunc);
+            f << "unicode gcode";
+        }
+        std::string upath = up.u8string();
+        for (char& c : upath)
+            if (c == '\\') c = '/';
+        e = submit("{\"submission_scope\":\"" + scope +
+                   "\",\"idempotency_key\":\"" + kKey15 +
+                   "\",\"command\":" + print_cmd(kDev2, upath, sha0) + "}");
+        CHECK(ok(e));
+        CHECK(wait_receipt_state(kKey15, scope, 5000) == "failed");
+        CHECK(none_err(kKey15) == "file_changed");
+
+        // Same through the zip container check (supply "none").
+        const fs::path uz = cdir / std::filesystem::u8path(
+                             "plate-\xe6\xb5\x8b\xe8\xaf\x95\xf0\x9f\x8c\xb8.3mf");
+        write_min_plate_zip(uz, "Metadata/plate_1.gcode", "G1 X10 Y10 F3000\n");
+        std::string uzpath = uz.u8string();
+        for (char& c : uzpath)
+            if (c == '\\') c = '/';
+        e = submit("{\"submission_scope\":\"" + scope +
+                   "\",\"idempotency_key\":\"" + kKey16 +
+                   "\",\"command\":" + none_cmd(kDev2, uzpath, sha0, false) + "}");
+        CHECK(ok(e));
+        CHECK(wait_receipt_state(kKey16, scope, 5000) == "failed");
+        CHECK(none_err(kKey16) == "file_changed");
+
+        // MAX_PATH: a >260-char absolute path only opens behind the
+        // \\?\ prefix os::open_path adds.
+        fs::path longp = cdir / "obn_long_path";
+        for (int i = 0; i < 8; ++i)
+            longp /= "seg" + std::to_string(i) + std::string(30, 'x');
+        std::error_code lec;
+        fs::create_directories(obn::os::open_path(longp.u8string()), lec);
+        CHECK(!lec);
+        {
+            std::ofstream f(obn::os::open_path((longp / "deep.gcode").u8string()),
+                            std::ios::binary | std::ios::trunc);
+            f << "deep gcode";
+        }
+        std::string lpath = (longp / "deep.gcode").u8string();
+        for (char& c : lpath)
+            if (c == '\\') c = '/';
+        e = submit("{\"submission_scope\":\"" + scope +
+                   "\",\"idempotency_key\":\"" + kKey17 +
+                   "\",\"command\":" + print_cmd(kDev2, lpath, sha0) + "}");
+        CHECK(ok(e));
+        CHECK(wait_receipt_state(kKey17, scope, 5000) == "failed");
+        CHECK(none_err(kKey17) == "file_changed");
+        fs::remove_all(obn::os::open_path((cdir / "obn_long_path").u8string()),
+                       lec);
+    }
+
     // Both worker failures released the kDev2 lane: a fresh key accepts.
     obn::queue::test_set_dispatch_enabled(false);
     e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
@@ -947,6 +1096,7 @@ int main()
     test_events_poll();
     test_session_purge();
     test_read_text_file();
+    test_mapping_outputs();
     test_commands();
 
     if (fail_count) {
