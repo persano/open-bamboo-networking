@@ -12,6 +12,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -329,6 +330,13 @@ static void test_devices_watch_snapshot()
     CHECK(p.find("nozzle_diameter").as_number() == 0.4);
     CHECK(p.find("status_age_ms").is_number());
 
+    // Per-printer command support advertises the capability-gated
+    // supply "none" mode alongside ams/external.
+    const json::Array& sm = p.find("command_support.supply_modes").as_array();
+    CHECK(sm.size() == 3);
+    CHECK(sm[0].as_string() == "ams");
+    CHECK(sm[2].as_string() == "none");
+
     // snapshot.get for a device outside the watch set.
     e = call(client_op("snapshot.get", ",\"params\":{\"device_ids\":[\"other\"]}"));
     CHECK(err_code(e) == "device_unavailable");
@@ -555,6 +563,66 @@ static std::string print_cmd(const std::string& dev, const std::string& path,
            "\"timelapse\":false}}}";
 }
 
+// command.submit for supply "none": empty materials, options false.
+static std::string none_cmd(const std::string& dev, const std::string& path,
+                            const std::string& sha, bool bad_opt = false)
+{
+    return "{\"kind\":\"print\",\"device_id\":\"" + dev + "\",\"payload\":{"
+           "\"file\":{\"path\":\"" + path + "\",\"sha256\":\"" + sha +
+           "\",\"plate_index\":1},"
+           "\"task_tag\":\"t-none\",\"supply\":\"none\",\"materials\":[],"
+           "\"options\":{\"bed_leveling\":" +
+           std::string(bad_opt ? "true" : "false") +
+           ",\"flow_calibration\":false,\"timelapse\":false}}}";
+}
+
+static std::uint32_t crc32_bytes(const std::string& s)
+{
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (unsigned char c : s) {
+        crc ^= c;
+        for (int i = 0; i < 8; ++i)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+// Minimal single-entry STORED zip carrying one plate gcode entry: local
+// header, central directory, EOCD (sizes always from the central
+// directory; zip::read_entry verifies the CRC-32 below).
+static void write_min_plate_zip(const std::filesystem::path& p,
+                                const std::string&           entry,
+                                const std::string&           body)
+{
+    const std::uint32_t crc  = crc32_bytes(body);
+    const std::uint32_t size = static_cast<std::uint32_t>(body.size());
+    const std::uint16_t nlen = static_cast<std::uint16_t>(entry.size());
+    std::string out;
+    auto u16 = [&](std::uint16_t v) {
+        out.push_back(static_cast<char>(v & 0xFF));
+        out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    };
+    auto u32 = [&](std::uint32_t v) {
+        u16(static_cast<std::uint16_t>(v & 0xFFFF));
+        u16(static_cast<std::uint16_t>((v >> 16) & 0xFFFF));
+    };
+    u32(0x04034b50); u16(20); u16(0); u16(0); u16(0); u16(0);
+    u32(crc); u32(size); u32(size); u16(nlen); u16(0);
+    out += entry;
+    out += body;
+    const std::uint32_t cd_off = static_cast<std::uint32_t>(out.size());
+    u32(0x02014b50); u16(20); u16(20); u16(0); u16(0); u16(0); u16(0);
+    u32(crc); u32(size); u32(size); u16(nlen); u16(0); u16(0); u16(0);
+    u16(0); u32(0); u32(0);
+    out += entry;
+    const std::uint32_t cd_size =
+        static_cast<std::uint32_t>(out.size()) - cd_off;
+    u32(0x06054b50); u16(0); u16(0); u16(1); u16(1);
+    u32(cd_size); u32(cd_off); u16(0);
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(out.data(), static_cast<std::streamsize>(out.size()));
+}
+
 // Poll command.get until the receipt leaves "accepted" (worker threads run
 // detached); returns the last observed state, "" on timeout.
 static std::string wait_receipt_state(const std::string& key,
@@ -624,13 +692,14 @@ static void test_commands()
                kDev + "\"}}");
     CHECK(err_code(e) == "not_supported");
     {
-        // supply "none" is parsed but not advertised.
+        // supply "none" now parses; print_cmd's non-empty materials
+        // fails the empty-materials rule instead of not_supported.
         std::string cmd = print_cmd(kDev, "C:/none.gcode", sha0);
         const auto pos  = cmd.find("\"supply\":\"external\"");
         cmd.replace(pos, 19, "\"supply\":\"none\"");
         e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
                    "\",\"command\":" + cmd + "}");
-        CHECK(err_code(e) == "not_supported");
+        CHECK(err_code(e) == "invalid_request");
     }
     e = submit("{\"submission_scope\":\"s\",\"idempotency_key\":\"" + key1 +
                "\",\"command\":" + print_cmd("ghost-dev", "C:/none.gcode", sha0) + "}");
@@ -779,6 +848,84 @@ static void test_commands()
                                "\",\"idempotency_key\":\"" + key5 + "\"}"));
         CHECK(e.v.find("result.error.code").as_string() == "file_changed");
     }
+
+    // --- supply "none": validation + container integrity only. ---
+    auto none_err = [&](const std::string& key) {
+        Envelope g = call(client_op(
+            "command.get",
+            ",\"params\":{\"submission_scope\":\"" + scope +
+                "\",\"idempotency_key\":\"" + key + "\"}"));
+        return g.v.find("result.error.code").as_string();
+    };
+    auto submit_none = [&](const std::string& key, const std::string& path,
+                           bool bad_opt) {
+        return submit("{\"submission_scope\":\"" + scope +
+                      "\",\"idempotency_key\":\"" + key +
+                      "\",\"command\":" + none_cmd(kDev2, path, sha0, bad_opt) +
+                      "}");
+    };
+    const std::string kKey9  = "stage3-key-00000009";
+    const std::string kKey10 = "stage3-key-00000010";
+    const std::string kKey11 = "stage3-key-00000011";
+    const std::string kKey12 = "stage3-key-00000012";
+    const std::string kKey13 = "stage3-key-00000013";
+    const std::string kKey14 = "stage3-key-00000014";
+
+    // Non-empty materials and a true calibration option reject at
+    // validation (schema: empty materials, options all false).
+    e = submit("{\"submission_scope\":\"" + scope + "\",\"idempotency_key\":\"" +
+               kKey9 + "\",\"command\":{\"kind\":\"print\",\"device_id\":\"" +
+               kDev2 + "\",\"payload\":{\"file\":{\"path\":\"C:/none/x.3mf\","
+               "\"sha256\":\"" + sha0 + "\",\"plate_index\":1},"
+               "\"task_tag\":\"t9\",\"supply\":\"none\","
+               "\"materials\":[{\"source_filament_id\":\"0\","
+               "\"slot_id\":\"external\",\"type\":\"PLA\",\"profile_id\":\"p0\","
+               "\"source_color\":\"#FF0000\",\"target_color\":\"#FF0000\"}],"
+               "\"options\":{\"bed_leveling\":false,\"flow_calibration\":false,"
+               "\"timelapse\":false}}}}");
+    CHECK(err_code(e) == "invalid_request");
+    e = submit_none(kKey10, "C:/none/x.3mf", true);
+    CHECK(err_code(e) == "invalid_request");
+
+    std::string paypath = (cdir / "payload.gcode").string();
+    for (char& c : paypath)
+        if (c == '\\') c = '/';
+
+    // A valid container (the plate gcode entry the printer extracts)
+    // passes the container check and fails only at the byte check, as
+    // file_changed: the sha0 above is wrong for these bytes.
+    std::string zipok = (cdir / "plate_ok.3mf").string();
+    for (char& c : zipok)
+        if (c == '\\') c = '/';
+    write_min_plate_zip(cdir / "plate_ok.3mf", "Metadata/plate_1.gcode",
+                        "G1 X10 Y10 F3000\n");
+    e = submit_none(kKey11, zipok, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey11, scope, 5000) == "failed");
+    CHECK(none_err(kKey11) == "file_changed");
+
+    // An existing non-archive and an archive without this plate's entry
+    // fail the container check closed (content is never inspected).
+    e = submit_none(kKey12, paypath, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey12, scope, 5000) == "failed");
+    CHECK(none_err(kKey12) == "unsafe_gcode");
+
+    std::string zipp2 = (cdir / "plate_only2.3mf").string();
+    for (char& c : zipp2)
+        if (c == '\\') c = '/';
+    write_min_plate_zip(cdir / "plate_only2.3mf", "Metadata/plate_2.gcode",
+                        "G1 X10 Y10 F3000\n");
+    e = submit_none(kKey13, zipp2, false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey13, scope, 5000) == "failed");
+    CHECK(none_err(kKey13) == "unsafe_gcode");
+
+    // An unreadable archive fails closed the same way.
+    e = submit_none(kKey14, "C:/obn-no-such/no.gcode", false);
+    CHECK(ok(e));
+    CHECK(wait_receipt_state(kKey14, scope, 5000) == "failed");
+    CHECK(none_err(kKey14) == "unsafe_gcode");
 
     // Both worker failures released the kDev2 lane: a fresh key accepts.
     obn::queue::test_set_dispatch_enabled(false);

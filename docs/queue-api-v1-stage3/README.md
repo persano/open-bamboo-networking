@@ -190,13 +190,22 @@ the reviewed upstream revision; null remains unknown. Active-source exposure, if
 needed later, should be a separate nullable field with documented evidence.
 
 Mechanical A1 plate changing uses **the same print operation**, a separate ordinary
-3MF and a fresh idempotency key/job ID. The proposed optional `supply:"none"` payload
-requires capability support, empty materials, disabled calibration/timelapse/leveling,
-and native validation of a bounded supported G-code subset with no extrusion or
-filament loading. Unknown macros/commands or an unverifiable file fail before
-dispatch. Mere user labeling or empty mapping is not proof. The accepted subset and
-firmware constraints must be agreed before advertising `none`; keep it unsupported
-until then. This is a print capability, not a special plate-changer API.
+3MF and a fresh idempotency key/job ID. The `supply:"none"` payload is
+capability-advertised and means user-confirmed "no automatic filament loading":
+the queue must not initiate filament loading or require an AMS or external-spool
+selection for this submission, and calibration, timelapse and bed-leveling
+options must all be false. The responsibility boundary is deliberate: the plugin
+owns correct submission, sequencing, duplicate prevention and correlated
+terminal evidence; the user owns whether their selected 3MF suits their printer
+and plate-change hardware. The library therefore performs container and
+integrity checks only for this mode: the submitted bytes must match the declared
+SHA-256, and the archive must carry its `Metadata/plate_<plate_index>.gcode`
+entry (the same entry the printer extracts as `param` from
+`build_project_file_json`); a failure reports as `file_changed` or
+`unsafe_gcode` before dispatch. The library makes no claim about the file's
+G-code content: no extrusion, heating or macro verification is performed or
+required, and the submission is sent unchanged. The confirming UI lives on the
+client side; this stays a print capability, not a special plate-changer API.
 
 Automatic sequencing requires matched, quiescent `completed` evidence with error 0,
 then a fresh available/idle, fault-free printer check. Failed/cancelled jobs do not
@@ -216,7 +225,7 @@ stop command. No implicit conversion from skip to stop.
 Retain existing errors. Proposed additions: `idempotency_conflict`,
 `submission_scope_changed`, `submission_store_unavailable`, `not_found`,
 `signed_out`, `not_authorized`, `stale_status`, `invalid_mapping`, `file_changed`,
-`job_mismatch`, `would_end_job`, `result_unknown`, `unsafe_file`. Only an `ok:true`
+`job_mismatch`, `would_end_job`, `result_unknown`, `unsafe_file`, `unsafe_gcode`. Only an `ok:true`
 receipt acknowledges library acceptance. Generic/internal/transport failure is
 ambiguous; recover by key. Errors must not include credentials or file contents.
 
@@ -227,7 +236,9 @@ Please review in particular:
    internal SDK retries can honor at-most-once dispatch.
 3. Correlation of the returned job ID to printer start/end identifiers, including
    external jobs and trustworthy end-G-code/quiescence evidence on A1/P1S.
-4. The optional `supply:none` validation subset (safe to defer separately).
+4. The responsibility boundary for `supply:none` as written above
+   (user-confirmed suitability, container and integrity checks only in the
+   library, no G-code content certification).
 5. Whether metadata needed for native material validation should be read entirely
    from 3MF, reducing the proposed redundant material fields before implementation.
 

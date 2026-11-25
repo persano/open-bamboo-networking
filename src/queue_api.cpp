@@ -19,6 +19,7 @@
 #include "obn/log.hpp"
 #include "obn/mqtt_seq.hpp"
 #include "obn/receipt_store.hpp"
+#include "obn/zip_read.hpp"
 
 #include <openssl/evp.h>
 
@@ -94,9 +95,11 @@ bool dispatch_enabled()
 }
 
 // Stage-3 advertised command surface (global capabilities and per-printer
-// command_support): skip_objects and supply "none" stay unadvertised
-// until their validation subsets exist (README: keep unsupported until
-// agreed).
+// command_support): skip_objects stays unadvertised until its validation
+// subset exists (README: keep unsupported until agreed). supply "none"
+// ships capability-gated as the user-confirmed no-automatic-filament-
+// loading mode: container checks only, G-code content is the user's
+// responsibility (README boundary).
 json::Array command_kinds_array()
 {
     json::Array a;
@@ -114,7 +117,7 @@ json::Array print_options_array()
 json::Array supply_modes_array()
 {
     json::Array a;
-    for (const char* k : {"ams", "external"})
+    for (const char* k : {"ams", "external", "none"})
         a.push_back(json::Value(k));
     return a;
 }
@@ -1067,6 +1070,37 @@ std::string sha256_file_hex(const std::string& path, bool* exists)
     return out;
 }
 
+// --- supply "none" container check (docs/queue-api-v1-stage3/README) -----
+// "none" is the user-confirmed "no automatic filament loading" mode: the
+// library must not initiate filament loading or require an AMS/external
+// selection, and certifies only container integrity. The G-code content
+// of a user-supplied file is the user's responsibility, never scanned.
+
+constexpr std::size_t kMaxNoneGcodeBytes = 64 * 1024 * 1024;
+
+// The archive entry the printer itself extracts for this plate:
+// build_project_file_json writes param = Metadata/plate_<N>.gcode
+// (print_job.cpp), so the check reads exactly what the printer reads.
+std::string none_gcode_entry(int plate)
+{
+    return "Metadata/plate_" + std::to_string(plate) + ".gcode";
+}
+
+// Container integrity for supply "none": the archive must parse and
+// carry this plate's gcode entry; zip::read_entry also verifies the
+// entry CRC-32. Content is never inspected.
+bool none_gcode_entry_present(const std::string& path, int plate,
+                              const char** err)
+{
+    std::vector<std::uint8_t> bytes;
+    if (!obn::zip::read_entry(path, none_gcode_entry(plate),
+                              kMaxNoneGcodeBytes, &bytes)) {
+        *err = "cannot read plate gcode from archive";
+        return false;
+    }
+    return true;
+}
+
 // Canonical fingerprint: SHA-256 over the re-dumped command object.
 // json::Object is an ordered map, so member order and whitespace
 // normalize away; array order and values stay significant (contract
@@ -1432,20 +1466,20 @@ bool parse_command(const json::Value& cmd, SubmitCommand* out,
     out->task_tag = gv(po, "task_tag").as_string();
 
     const std::string supply = gv(po, "supply").as_string();
-    if (supply == "none") {
-        *code = "not_supported";
-        *err  = "supply mode none is not advertised";
-        return false;
-    }
-    if (supply != "ams" && supply != "external") {
-        *err = "supply must be \"ams\" or \"external\"";
+    if (supply != "ams" && supply != "external" && supply != "none") {
+        *err = "supply must be \"ams\", \"external\" or \"none\"";
         return false;
     }
     out->supply = supply;
 
     const json::Value& mats = gv(po, "materials");
-    if (!mats.is_array() || mats.as_array().size() < 1 ||
-        mats.as_array().size() > 64) {
+    if (supply == "none") {
+        if (!mats.is_array() || !mats.as_array().empty()) {
+            *err = "supply \"none\" requires an empty materials array";
+            return false;
+        }
+    } else if (!mats.is_array() || mats.as_array().size() < 1 ||
+               mats.as_array().size() > 64) {
         *err = "materials must be an array of 1..64 entries";
         return false;
     }
@@ -1528,6 +1562,12 @@ bool parse_command(const json::Value& cmd, SubmitCommand* out,
     out->bed_leveling     = gv(opts.as_object(), "bed_leveling").as_bool();
     out->flow_calibration = gv(opts.as_object(), "flow_calibration").as_bool();
     out->timelapse        = gv(opts.as_object(), "timelapse").as_bool();
+    if (supply == "none" &&
+        (out->bed_leveling || out->flow_calibration || out->timelapse)) {
+        *err = "supply \"none\" requires options bed_leveling, flow_calibration "
+               "and timelapse false";
+        return false;
+    }
 
     out->command = cmd;
     return true;
@@ -2096,7 +2136,19 @@ void worker_print(std::string key, SubmitCommand sc, std::string epoch)
     }
 
     // File verification before any dispatch boundary: file errors are
-    // retained receipt failures, never uploads (contract).
+    // retained receipt failures, never uploads (contract). supply "none"
+    // runs a container integrity check first: the archive must carry the
+    // plate gcode entry the printer will extract. The file's G-code
+    // content is the user's responsibility (contract README boundary) and
+    // is never inspected.
+    if (sc.supply == "none") {
+        const char* sub_err = nullptr;
+        if (!none_gcode_entry_present(sc.file_path, sc.plate_index, &sub_err)) {
+            fail_pre("unsafe_gcode", false,
+                     sub_err ? sub_err : "archive lacks plate gcode entry");
+            return;
+        }
+    }
     bool               exists = false;
     const std::string  digest = sha256_file_hex(sc.file_path, &exists);
     if (!exists || digest.empty()) {
