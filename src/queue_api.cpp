@@ -684,7 +684,10 @@ json::Value enrich_job_locked(const std::string& dev_id, const json::Value& job,
     if (st == "completed" || st == "failed" || st == "cancelled") {
         json::Object t;
         t["state"]      = json::Value(st);
-        t["error_code"] = json::Value(nullptr); // frames carry no numeric code
+        // Completed is known error free: explicit 0 (contract sequencing
+        // rule). failed/cancelled carry no native numeric code: null.
+        t["error_code"] = st == "completed" ? json::Value(0.0)
+                                            : json::Value(nullptr);
         t["observed_at"] = json::Value(ev->observed_at);
         t["source"]      = json::Value("printer_report");
         t["correlation"] = json::Value("matched");
@@ -1415,8 +1418,14 @@ json::Value job_result(const std::string& scope, const json::Object& rec,
         // receipt-only terminals (never dispatched) stay unverified.
         const bool matched = have_ev && !ev.state.empty() && ev.state == js;
         json::Object t;
-        t["state"]                 = json::Value(js);
-        t["error_code"]            = json::Value(nullptr); // no printer code observed
+        t["state"] = json::Value(js);
+        // Completed is known error free, so it carries the explicit 0 the
+        // contract's sequencing rule requires ("matched, quiescent
+        // completed evidence with error 0"); any other terminal has no
+        // native numeric code and stays null (unknown is null, not zero).
+        t["error_code"] =
+            (matched && js == "completed") ? json::Value(0.0)
+                                           : json::Value(nullptr);
         t["observed_at"]           = json::Value(matched ? ev.observed_at : ts);
         t["source"]                = json::Value(matched ? "printer_report" : "unknown");
         t["correlation"]           = json::Value(matched ? "matched" : "unverified");
