@@ -1087,6 +1087,226 @@ static void test_commands()
     fs::remove_all(cdir, ec);
 }
 
+// ---------------------------------------------------------------------------
+// Stage-3 job correlation: receipt job id bound to printer frame evidence
+// (docs/queue-api-v1-stage3 README "Job lifecycle and evidence").
+// Dispatch is simulated through test_mark_dispatched (no SDK).
+// ---------------------------------------------------------------------------
+static void test_job_correlation()
+{
+    namespace fs = std::filesystem;
+    const fs::path cdir = fs::temp_directory_path() / "obn_queue_corr_test";
+    std::error_code ec;
+    fs::remove_all(cdir, ec);
+    fs::create_directories(cdir, ec);
+
+    // Reuse the live client from test_commands (never closed).
+    CHECK(!g_client.empty());
+
+    const std::string kDevC = "01P00C490800270";
+    obn::queue::note_devices_from_cloud(
+        "{\"devices\":[{\"dev_id\":\"" + kDevC +
+        "\",\"dev_name\":\"P1S-C\",\"dev_product_name\":\"Bambu Lab P1S\"}]}");
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,\"gcode_state\":\"IDLE\"}}");
+
+    obn::queue::test_set_command_session("u_queue_corr", cdir.string());
+    obn::queue::test_set_dispatch_enabled(false);
+
+    Envelope e = call(req("capabilities", "", "q5"));
+    CHECK(ok(e));
+    const std::string scope = e.v.find("result.submission.scope").as_string();
+    CHECK(!scope.empty());
+
+    e = call(client_op("watch.set",
+                       ",\"params\":{\"device_ids\":[\"" + kDevC + "\"]}"));
+    CHECK(ok(e));
+    std::string cursor = e.v.find("result.cursor").as_string();
+
+    const std::string sha0(64, '0');
+    const std::string keyA = "stage3-corr-key-0001";
+    const std::string keyB = "stage3-corr-key-0002";
+
+    auto submit = [&](const std::string& key) {
+        return call(client_op(
+            "command.submit",
+            ",\"params\":{\"submission_scope\":\"" + scope +
+                "\",\"idempotency_key\":\"" + key + "\",\"command\":" +
+                print_cmd(kDevC, "C:/none.gcode", sha0) + "}"));
+    };
+    auto job_get = [&](const std::string& jid) {
+        return call(client_op(
+            "job.get",
+            ",\"params\":{\"submission_scope\":\"" + scope +
+                "\",\"device_id\":\"" + kDevC + "\",\"job_id\":\"" + jid +
+                "\"}"));
+    };
+    auto snapshot = [&]() {
+        return call(client_op(
+            "snapshot.get", ",\"params\":{\"device_ids\":[\"" + kDevC + "\"]}"));
+    };
+
+    // Job A: accepted, then a confirmed dispatch (simulated).
+    e = submit(keyA);
+    CHECK(ok(e));
+    const std::string jidA = e.v.find("result.job_id").as_string();
+    CHECK(jidA.rfind("job-", 0) == 0);
+    obn::queue::test_mark_dispatched(kDevC, keyA);
+
+    // Dispatch acknowledged, no frame yet: receipt-derived, no job_key.
+    e = job_get(jidA);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "printing");
+    CHECK(e.v.find("result.job.job_key").is_null());
+    CHECK(e.v.find("result.job.terminal").is_null());
+
+    // A frame with the printer's native task_id correlates.
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,"
+        "\"gcode_state\":\"RUNNING\",\"mc_percent\":42,"
+        "\"task_id\":\"task-corr-a\"}}");
+    e = job_get(jidA);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "printing");
+    CHECK(e.v.find("result.job.job_key").as_string() == "task-corr-a");
+    CHECK(e.v.find("result.job.started_at").is_string());
+    CHECK(e.v.find("result.job.terminal").is_null());
+
+    // Terminal frame: correlated completed outcome.
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,"
+        "\"gcode_state\":\"FINISH\",\"mc_percent\":100,"
+        "\"task_id\":\"task-corr-a\"}}");
+    e = job_get(jidA);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "completed");
+    CHECK(e.v.find("result.job.job_key").as_string() == "task-corr-a");
+    CHECK(e.v.find("result.job.terminal.state").as_string() == "completed");
+    CHECK(e.v.find("result.job.terminal.correlation").as_string() == "matched");
+    CHECK(e.v.find("result.job.terminal.source").as_string() == "printer_report");
+    CHECK(e.v.find("result.job.terminal.quiescent").as_bool() == false);
+    CHECK(e.v.find("result.job.terminal.observed_at").is_string());
+
+    // Post-release snapshot still correlates through the native task_id.
+    e = snapshot();
+    CHECK(ok(e));
+    {
+        const json::Value& p = e.v.find("result.printers").as_array()[0];
+        CHECK(p.find("job.job_id").as_string() == jidA);
+        CHECK(p.find("job.state").as_string() == "completed");
+        CHECK(p.find("job.terminal.correlation").as_string() == "matched");
+    }
+
+    // Job B on the freed lane: a second, independent correlation.
+    e = submit(keyB);
+    CHECK(ok(e));
+    const std::string jidB = e.v.find("result.job_id").as_string();
+    CHECK(jidB != jidA);
+    obn::queue::test_mark_dispatched(kDevC, keyB);
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,"
+        "\"gcode_state\":\"RUNNING\",\"mc_percent\":7,"
+        "\"task_id\":\"task-corr-b\"}}");
+
+    e = job_get(jidB);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "printing");
+    CHECK(e.v.find("result.job.job_key").as_string() == "task-corr-b");
+    // Job A never regresses to job B's frames.
+    e = job_get(jidA);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "completed");
+
+    // One poll carries every correlated job.state / printer.status.
+    e = call(client_op("events.poll",
+                       ",\"params\":{\"cursor\":\"" + cursor +
+                           "\",\"limit\":64}"));
+    CHECK(ok(e));
+    {
+        int  seen_a_print = 0, seen_a_done = 0, seen_b_print = 0;
+        bool a_print_no_terminal = false, a_done_matched = false;
+        int  seen_b_status = 0;
+        for (const json::Value& ev : e.v.find("result.events").as_array()) {
+            const std::string kind = ev.find("kind").as_string();
+            if (kind == "job.state") {
+                const json::Value& job = ev.find("data.job");
+                const std::string  jid = job.find("job_id").as_string();
+                const std::string  st  = job.find("state").as_string();
+                if (jid == jidA && st == "printing") {
+                    ++seen_a_print;
+                    a_print_no_terminal = job.find("terminal").is_null();
+                } else if (jid == jidA && st == "completed") {
+                    ++seen_a_done;
+                    a_done_matched =
+                        job.find("terminal.correlation").as_string() == "matched";
+                } else if (jid == jidB && st == "printing") {
+                    ++seen_b_print;
+                }
+            } else if (kind == "printer.status") {
+                if (ev.find("data.job.job_id").as_string() == jidB)
+                    ++seen_b_status;
+            }
+        }
+        CHECK(seen_a_print == 1);
+        CHECK(seen_a_done == 1);
+        CHECK(seen_b_print == 1);
+        CHECK(a_print_no_terminal);
+        CHECK(a_done_matched);
+        CHECK(seen_b_status >= 1);
+    }
+
+    // IDLE after a seen job releases the lane with an unknown outcome.
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,\"gcode_state\":\"IDLE\"}}");
+    e = job_get(jidB);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "unknown");
+    CHECK(e.v.find("result.job.terminal").is_null());
+
+    // An uncorrelated (external) job never carries a job id.
+    e = call(client_op("watch.set",
+                       ",\"params\":{\"device_ids\":[\"" + kDevC + "\"]}"));
+    CHECK(ok(e));
+    cursor = e.v.find("result.cursor").as_string();
+    obn::queue::ingest_frame(kDevC,
+        "{\"print\":{\"command\":\"push_status\",\"msg\":1,"
+        "\"gcode_state\":\"RUNNING\",\"mc_percent\":3,"
+        "\"task_id\":\"task-ext-9\"}}");
+    e = snapshot();
+    CHECK(ok(e));
+    {
+        const json::Value& p = e.v.find("result.printers").as_array()[0];
+        CHECK(p.find("job.state").as_string() == "printing");
+        CHECK(!p.find("job.job_id").is_string());
+    }
+    e = call(client_op("events.poll",
+                       ",\"params\":{\"cursor\":\"" + cursor +
+                           "\",\"limit\":64}"));
+    CHECK(ok(e));
+    {
+        bool ext_job_event = false, ext_uncorrelated = false;
+        for (const json::Value& ev : e.v.find("result.events").as_array()) {
+            if (ev.find("kind").as_string() != "job.state") continue;
+            ext_job_event      = true;
+            ext_uncorrelated   = !ev.find("data.job.job_id").is_string();
+        }
+        CHECK(ext_job_event);
+        CHECK(ext_uncorrelated);
+    }
+
+    // The external frame never touches job A or B.
+    e = job_get(jidA);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "completed");
+    e = job_get(jidB);
+    CHECK(ok(e));
+    CHECK(e.v.find("result.job.state").as_string() == "unknown");
+
+    obn::queue::test_clear_command_session();
+    obn::queue::test_set_dispatch_enabled(true);
+    fs::remove_all(cdir, ec);
+}
+
 int main()
 {
     test_validation();
@@ -1098,6 +1318,7 @@ int main()
     test_read_text_file();
     test_mapping_outputs();
     test_commands();
+    test_job_correlation();
 
     if (fail_count) {
         std::fprintf(stderr, "%d check(s) failed\n", fail_count);
