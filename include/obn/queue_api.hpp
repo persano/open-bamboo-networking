@@ -43,6 +43,11 @@ void test_set_command_session(const std::string& user_id,
                               const std::string& config_dir);
 void test_clear_command_session();
 void test_set_dispatch_enabled(bool enabled);
+// Simulate the print worker's confirmed dispatch (receipt marker +
+// SDK success, no SDK call) so frame-correlation tests can drive
+// ingest_frame against a dispatched lane.
+void test_mark_dispatched(const std::string& device_id,
+                          const std::string& idempotency_key);
 // Parse a full print command and return the flat / snake / detail
 // mapping strings build_print_params would set (no Agent, no store).
 bool test_build_mapping(const std::string& cmd_json, std::string* flat,

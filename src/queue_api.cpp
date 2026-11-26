@@ -69,6 +69,22 @@ constexpr char        kCapRev[]            = "stage3-draft-1";
 struct LaneEntry {
     std::string key;       // owning idempotency key
     bool        dispatched = false; // may_have_been_sent durably recorded
+    bool        confirmed  = false; // SDK returned print dispatch success
+};
+// Stage-3 job correlation evidence (docs/queue-api-v1-stage3 README
+// "Job lifecycle and evidence"): what this receipt's job looked like in
+// the printer's own frames while it owned the device's print lane.
+// Keyed by idempotency key so a terminal outcome survives the lane's
+// release; a new job claims a new key and never inherits an old job's
+// state. Guarded by g_submit_mu like the lanes.
+struct JobEvidence {
+    std::string dev;
+    std::string jid;         // receipt job id (the additive job_id)
+    std::string state;       // last observed job state; "" = no frame yet
+    std::string task_id;     // printer's native task_id (job_key fill)
+    std::string first_seen;  // UTC of the first correlated job frame
+    std::string observed_at; // UTC of the latest correlated job frame
+    std::uint64_t conn_seq = 0;
 };
 // Serializes dedup + lane check + reservation + lane claim so two keys
 // cannot both claim one device's lane between check and reserve.
@@ -76,6 +92,7 @@ struct LaneEntry {
 // submission never takes reg().mu while holding g_submit_mu.
 std::mutex g_submit_mu;
 std::map<std::string, LaneEntry> g_print_lanes; // device_id -> lane
+std::map<std::string, JobEvidence> g_job_evidence; // idempotency key -> evidence
 
 #ifdef OBN_TESTING
 // Test seams (queue_api.hpp): inject session/config for the receipt
@@ -488,6 +505,19 @@ std::string job_state_of(const std::string& gcode)
     return "unknown";
 }
 
+// UTC observation stamp, same shape as the receipt store's ("...Z").
+std::string utc_stamp()
+{
+    const auto t = std::time(nullptr);
+    std::tm    tm{};
+    obn::os::gmtime_safe(t, &tm);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
+                  tm.tm_min, tm.tm_sec);
+    return buf;
+}
+
 json::Value build_job(const json::Value& print_v, const std::string& gcode)
 {
     const std::string jstate = job_state_of(gcode);
@@ -603,6 +633,76 @@ json::Array build_slots(const json::Value& print_v)
     return slots;
 }
 
+// Stage-3 correlation for a stage-2 job object (README "Job lifecycle
+// and evidence"): while this device's dispatched lane is open, the
+// frame's job is the lane owner's job; after the lane releases, the
+// printer's native task_id must match the recorded evidence. Adds the
+// additive job_id / device_id / started_at / terminal fields only on a
+// correlated job, so an external (Orca-started) job keeps the pure
+// stage-2 shape and never carries an invented job id. `corr`, when set,
+// is evidence captured while the lane was still open (the terminal
+// frame releases the lane before events are built). Caller holds
+// reg().mu; takes g_submit_mu (lock order reg().mu then g_submit_mu).
+json::Value enrich_job_locked(const std::string& dev_id, const json::Value& job,
+                              const JobEvidence* corr = nullptr)
+{
+    if (!job.is_object()) return job;
+    json::Object o = job.as_object();
+    o["device_id"] = json::Value(dev_id);
+
+    const JobEvidence* ev = corr;
+    JobEvidence        owned;
+    if (!ev) {
+        const std::string tid = job.find("job_key").as_string();
+        std::lock_guard<std::mutex> sl(g_submit_mu);
+        auto lit = g_print_lanes.find(dev_id);
+        if (lit != g_print_lanes.end() && lit->second.dispatched) {
+            auto evit = g_job_evidence.find(lit->second.key);
+            // A differing native task_id means the frame shows a job this
+            // evidence never saw: conflicting evidence, never correlate.
+            if (evit != g_job_evidence.end() && !evit->second.jid.empty() &&
+                (evit->second.task_id.empty() || tid.empty() ||
+                 evit->second.task_id == tid))
+                owned = evit->second;
+        }
+        if (owned.jid.empty() && !tid.empty()) {
+            for (const auto& [k, e] : g_job_evidence) {
+                if (e.dev == dev_id && e.task_id == tid) {
+                    owned = e;
+                    break;
+                }
+            }
+        }
+        if (!owned.jid.empty()) ev = &owned;
+    }
+    if (!ev) return json::Value(std::move(o));
+
+    o["job_id"] = json::Value(ev->jid);
+    o["started_at"] = ev->first_seen.empty() ? json::Value(nullptr)
+                                             : json::Value(ev->first_seen);
+    const std::string st = job.find("state").as_string();
+    if (st == "completed" || st == "failed" || st == "cancelled") {
+        json::Object t;
+        t["state"]      = json::Value(st);
+        // Completed is known error free: explicit 0 (contract sequencing
+        // rule). failed/cancelled carry no native numeric code: null.
+        t["error_code"] = st == "completed" ? json::Value(0.0)
+                                            : json::Value(nullptr);
+        t["observed_at"] = json::Value(ev->observed_at);
+        t["source"]      = json::Value("printer_report");
+        t["correlation"] = json::Value("matched");
+        t["connection_generation"] =
+            json::Value("connection-" + std::to_string(ev->conn_seq));
+        // shortcut: end-G-code quiescence needs native proof on A1/P1S
+        // (acceptance open question); stay false until then.
+        t["quiescent"] = json::Value(false);
+        o["terminal"]  = json::Value(std::move(t));
+    } else {
+        o["terminal"] = json::Value(nullptr);
+    }
+    return json::Value(std::move(o));
+}
+
 json::Value build_printer_locked(const std::string& dev_id,
                                  const DeviceState*  d,
                                  const InventoryEntry* inv,
@@ -628,7 +728,8 @@ json::Value build_printer_locked(const std::string& dev_id,
     }
     p["status_age_ms"] = age;
     p["state"]         = json::Value(printer_state_of(online, gcode));
-    p["job"]           = d ? build_job(print_v, gcode) : json::Value(nullptr);
+    p["job"] = d ? enrich_job_locked(dev_id, build_job(print_v, gcode))
+                 : json::Value(nullptr);
     p["slots"]         = json::Value(build_slots(print_v));
 
     p["commands"]      = json::Value(json::Array{});
@@ -831,20 +932,56 @@ void ingest_frame(const std::string& dev_id, const std::string& json_text)
     const json::Value& merged_print = d.merged.find("print");
     const std::string  gcode = merged_print.find("gcode_state").as_string();
 
-    // Release the stage-3 print lane on job-end evidence: any terminal
-    // job state, or an explicit IDLE frame once the receipt crossed the
-    // dispatch marker (an uncertain dispatch that never started shows
-    // IDLE forever). Accepted-but-undispatched lanes stay: the worker
-    // owns those releases. Lock order: reg().mu then g_submit_mu.
+    // Stage-3 correlation, then lane release (one g_submit_mu scope;
+    // lock order: reg().mu then g_submit_mu). While the lane is
+    // dispatched the frame's job IS the lane owner's job (one lane per
+    // device), so record the evidence for job.get / job.state before the
+    // release below may close the lane on this same frame.
+    const std::string jst     = job_state_of(gcode);
+    const bool        terminal = jst == "completed" || jst == "failed" ||
+                         jst == "cancelled";
+    JobEvidence corr;
+    bool        have_corr = false;
     {
-        const std::string jst = job_state_of(gcode);
-        const bool terminal = jst == "completed" || jst == "failed" || jst == "cancelled";
-        if (terminal || gcode == "IDLE") {
-            std::lock_guard<std::mutex> sl(g_submit_mu);
-            auto lit = g_print_lanes.find(dev_id);
-            if (lit != g_print_lanes.end() &&
-                (terminal || lit->second.dispatched))
-                g_print_lanes.erase(lit);
+        std::lock_guard<std::mutex> sl(g_submit_mu);
+        auto lit = g_print_lanes.find(dev_id);
+        if (lit != g_print_lanes.end()) {
+            auto evit = g_job_evidence.find(lit->second.key);
+            const bool have_ev =
+                evit != g_job_evidence.end() && !evit->second.jid.empty();
+            const bool saw_job = have_ev && !evit->second.state.empty();
+            const std::string tid = merged_print.find("task_id").as_string();
+            // Conflicting native task_id: the frame shows a job this
+            // evidence never saw, so neither record nor correlate it.
+            const bool tid_conflict =
+                have_ev && !evit->second.task_id.empty() && !tid.empty() &&
+                evit->second.task_id != tid;
+            if (lit->second.dispatched && have_ev && !tid_conflict) {
+                JobEvidence& ev = evit->second;
+                if (!jst.empty()) ev.state = jst;
+                else if (gcode == "IDLE" && saw_job)
+                    ev.state = "unknown"; // ran, then vanished, no terminal gcode
+                if (!tid.empty() && tid.size() <= 128) ev.task_id = tid;
+                const std::string stamp = utc_stamp();
+                if (ev.first_seen.empty() && !jst.empty()) ev.first_seen = stamp;
+                if (!jst.empty()) ev.observed_at = stamp;
+                ev.conn_seq = d.conn_seq;
+                corr      = ev;
+                have_corr = true;
+            }
+            // Release on job-end evidence: any terminal job state, or an
+            // explicit IDLE frame once the dispatch stayed uncertain
+            // (may_have_been_sent, which may never start) or a seen job
+            // vanished without terminal gcode. A confirmed dispatch with
+            // no job seen yet keeps the lane through the upload window:
+            // IDLE there is the pre-start frame, not jobless evidence
+            // (contract: one lane until the correlated job is terminal).
+            // shortcut: a confirmed job the printer never runs keeps the
+            // lane until restart; revisit with task_id queue evidence.
+            bool release = terminal;
+            if (!release && gcode == "IDLE" && lit->second.dispatched)
+                release = !lit->second.confirmed || saw_job;
+            if (release) g_print_lanes.erase(lit);
         }
     }
 
@@ -862,7 +999,7 @@ void ingest_frame(const std::string& dev_id, const std::string& json_text)
         json::Object data;
         data["device_id"]            = json::Value(dev_id);
         data["connection_generation"] = json::Value(conn_generation(&d));
-        data["job"]                  = job;
+        data["job"] = enrich_job_locked(dev_id, job, have_corr ? &corr : nullptr);
         data["evidence"]             = json::Value("printer_report");
         push_event_locked(r, "job.state", dev_id, json::Value(std::move(data)));
     }
@@ -1228,19 +1365,35 @@ json::Value receipt_result(const std::string& scope, const json::Object& rec)
 }
 
 // job.get result (response.schema.json $defs/job). Receipt -> job state
-// mapping without printer correlation yet: only a not_sent failure or
-// cancellation proves the job never ran; anything past the dispatch
-// marker stays "unknown" until frame evidence lands (shortcut: live
-// frame correlation is a later step, covered by acceptance).
+// mapping: frame evidence recorded while this receipt's job owned the
+// device's print lane overrides the receipt (docs "Job lifecycle and
+// evidence"), so a dispatched job reports its correlated terminal
+// outcome instead of the dispatch marker; without evidence only a
+// not_sent failure or cancellation proves the job never ran, and
+// anything else past the dispatch marker stays receipt-derived.
 json::Value job_result(const std::string& scope, const json::Object& rec,
                        const DeviceSnap& snap)
 {
     const std::string state    = rec_str(rec, "state", "accepted");
     const std::string dispatch = rec_str(rec, "dispatch", "not_sent");
     const std::string ts       = rec_str(rec, "ts");
+    const std::string jid      = rec_str(rec, "jid");
+
+    JobEvidence ev;
+    bool        have_ev = false;
+    {
+        std::lock_guard<std::mutex> sl(g_submit_mu);
+        const auto it = g_job_evidence.find(rec_str(rec, "k"));
+        if (it != g_job_evidence.end() && !it->second.jid.empty() &&
+            it->second.jid == jid) {
+            ev      = it->second;
+            have_ev = true;
+        }
+    }
 
     std::string js;
-    if (state == "accepted")       js = "pending";
+    if (have_ev && !ev.state.empty()) js = ev.state; // correlated frame evidence
+    else if (state == "accepted")       js = "pending";
     else if (state == "working")   js = "preparing";
     else if (state == "succeeded") js = "printing"; // dispatch acknowledged
     else if (state == "failed")
@@ -1250,20 +1403,35 @@ json::Value job_result(const std::string& scope, const json::Object& rec,
     else js = "unknown";
 
     json::Object j;
-    j["job_id"]     = json::Value(rec_str(rec, "jid"));
+    j["job_id"]     = json::Value(jid);
     j["device_id"]  = json::Value(rec_str(rec, "dev"));
     j["state"]      = json::Value(js);
-    j["started_at"] = (js == "printing" && !ts.empty()) ? json::Value(ts)
-                                                        : json::Value(nullptr);
-    if (js == "failed" || js == "cancelled") {
+    std::string started;
+    if (have_ev && !ev.first_seen.empty()) started = ev.first_seen;
+    else if (js == "printing" && !ts.empty()) started = ts;
+    j["started_at"] = started.empty() ? json::Value(nullptr)
+                                      : json::Value(started);
+    j["job_key"] = (have_ev && !ev.task_id.empty()) ? json::Value(ev.task_id)
+                                                    : json::Value(nullptr);
+    if (js == "failed" || js == "cancelled" || js == "completed") {
+        // Frame-correlated terminals are matched printer evidence;
+        // receipt-only terminals (never dispatched) stay unverified.
+        const bool matched = have_ev && !ev.state.empty() && ev.state == js;
         json::Object t;
-        t["state"]                 = json::Value(js);
-        t["error_code"]            = json::Value(nullptr); // no printer code observed
-        t["observed_at"]           = json::Value(ts);
-        t["source"]                = json::Value("unknown");
-        t["correlation"]           = json::Value("unverified");
+        t["state"] = json::Value(js);
+        // Completed is known error free, so it carries the explicit 0 the
+        // contract's sequencing rule requires ("matched, quiescent
+        // completed evidence with error 0"); any other terminal has no
+        // native numeric code and stays null (unknown is null, not zero).
+        t["error_code"] =
+            (matched && js == "completed") ? json::Value(0.0)
+                                           : json::Value(nullptr);
+        t["observed_at"]           = json::Value(matched ? ev.observed_at : ts);
+        t["source"]                = json::Value(matched ? "printer_report" : "unknown");
+        t["correlation"]           = json::Value(matched ? "matched" : "unverified");
         t["connection_generation"] =
-            json::Value("connection-" + std::to_string(snap.conn_seq));
+            json::Value("connection-" +
+                        std::to_string(matched ? ev.conn_seq : snap.conn_seq));
         // quiescent needs native end-of-execution proof, never receipt
         // evidence alone (contract quiescent gate): stay false.
         t["quiescent"] = json::Value(false);
@@ -2270,6 +2438,10 @@ void worker_print(std::string key, SubmitCommand sc, std::string epoch)
             it->second.dispatched = true;
         else
             g_print_lanes[sc.device_id] = LaneEntry{key, true};
+        // Correlation evidence starts at the dispatch boundary: from
+        // here the printer's frames describe this receipt's job.
+        g_job_evidence[key] = JobEvidence{sc.device_id, rec_str(rec, "jid"),
+                                          "", "", "", "", 0};
     }
 
     const int rc = run_print_job(a, p);
@@ -2278,6 +2450,12 @@ void worker_print(std::string key, SubmitCommand sc, std::string epoch)
         patch["state"]    = json::Value("succeeded");
         patch["dispatch"] = json::Value("confirmed");
         receipt_update(store.get(), key, std::move(patch), "dispatch confirmed");
+        {
+            std::lock_guard<std::mutex> lk(g_submit_mu);
+            auto it = g_print_lanes.find(sc.device_id);
+            if (it != g_print_lanes.end() && it->second.key == key)
+                it->second.confirmed = true;
+        }
         // Lane stays: the physical job owns the device until ingest_frame
         // sees terminal/jobless evidence.
     } else {
@@ -2820,6 +2998,31 @@ void test_clear_command_session()
 void test_set_dispatch_enabled(bool enabled)
 {
     g_test_dispatch_on = enabled;
+}
+
+void test_mark_dispatched(const std::string& device_id, const std::string& key)
+{
+    // Mirrors the print worker's confirmed dispatch (marker + SDK
+    // success) without an SDK call: receipt succeeded/confirmed, lane
+    // dispatched + confirmed, correlation evidence bound to the
+    // receipt's job id.
+    std::string err;
+    auto        store = open_store(&err);
+    if (!store) return;
+    json::Object rec;
+    if (!store->get(key, &rec, &err)) return;
+    json::Object patch;
+    patch["state"]    = json::Value("succeeded");
+    patch["dispatch"] = json::Value("confirmed");
+    if (!receipt_update(store.get(), key, std::move(patch), "test dispatch"))
+        return;
+    std::lock_guard<std::mutex> lk(g_submit_mu);
+    auto it = g_print_lanes.find(device_id);
+    if (it == g_print_lanes.end() || it->second.key != key) return;
+    it->second.dispatched = true;
+    it->second.confirmed  = true;
+    g_job_evidence[key] = JobEvidence{device_id, rec_str(rec, "jid"),
+                                      "", "", "", "", 0};
 }
 
 // Mapping builders without a live Agent: parse a full print command
