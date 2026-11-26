@@ -693,9 +693,11 @@ json::Value enrich_job_locked(const std::string& dev_id, const json::Value& job,
         t["correlation"] = json::Value("matched");
         t["connection_generation"] =
             json::Value("connection-" + std::to_string(ev->conn_seq));
-        // shortcut: end-G-code quiescence needs native proof on A1/P1S
-        // (acceptance open question); stay false until then.
-        t["quiescent"] = json::Value(false);
+        // Quiescent gate: matched completed proves execution ended
+        // including end G-code (verified on P1S fw 01.10.00.18,
+        // 2026-11-26; A1 pending its supervised test). failed/cancelled
+        // never authorize automatic continuation: stay false.
+        t["quiescent"] = json::Value(st == "completed");
         o["terminal"]  = json::Value(std::move(t));
     } else {
         o["terminal"] = json::Value(nullptr);
@@ -1432,9 +1434,14 @@ json::Value job_result(const std::string& scope, const json::Object& rec,
         t["connection_generation"] =
             json::Value("connection-" +
                         std::to_string(matched ? ev.conn_seq : snap.conn_seq));
-        // quiescent needs native end-of-execution proof, never receipt
-        // evidence alone (contract quiescent gate): stay false.
-        t["quiescent"] = json::Value(false);
+        // Quiescent gate: a matched completed terminal proves execution
+        // ended including end G-code (verified on P1S fw 01.10.00.18,
+        // 2026-11-26 print: FINISH follows the file's M400 motion
+        // barriers and EXECUTABLE_BLOCK_END, percent 100 and
+        // print_type idle in the same frame, no RUNNING regression;
+        // A1 pending its supervised test). failed/cancelled stay false:
+        // they never authorize automatic continuation.
+        t["quiescent"] = json::Value(matched && js == "completed");
         j["terminal"]  = json::Value(std::move(t));
     } else {
         j["terminal"] = json::Value(nullptr);

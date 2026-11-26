@@ -235,7 +235,11 @@ Please review in particular:
 2. Where the native SDK's potentially effective dispatch boundary is, and whether
    internal SDK retries can honor at-most-once dispatch.
 3. Correlation of the returned job ID to printer start/end identifiers, including
-   external jobs and trustworthy end-G-code/quiescence evidence on A1/P1S.
+   external jobs. End-G-code/quiescence evidence: verified on P1S fw 01.10.00.18
+   (2026-11-26: FINISH follows the file's M400 motion barriers and
+   EXECUTABLE_BLOCK_END, percent 100 and print_type idle in the same frame, no
+   RUNNING regression), so matched completed reports `quiescent:true` there;
+   A1 pending its supervised test.
 4. The responsibility boundary for `supply:none` as written above
    (user-confirmed suitability, container and integrity checks only in the
    library, no G-code content certification).

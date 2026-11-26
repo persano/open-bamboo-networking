@@ -1185,7 +1185,7 @@ static void test_job_correlation()
     CHECK(e.v.find("result.job.terminal.correlation").as_string() == "matched");
     CHECK(e.v.find("result.job.terminal.source").as_string() == "printer_report");
     CHECK(e.v.find("result.job.terminal.error_code").as_number() == 0);
-    CHECK(e.v.find("result.job.terminal.quiescent").as_bool() == false);
+    CHECK(e.v.find("result.job.terminal.quiescent").as_bool() == true);
     CHECK(e.v.find("result.job.terminal.observed_at").is_string());
 
     // Post-release snapshot still correlates through the native task_id.
@@ -1226,7 +1226,7 @@ static void test_job_correlation()
     {
         int  seen_a_print = 0, seen_a_done = 0, seen_b_print = 0;
         bool a_print_no_terminal = false, a_done_matched = false;
-        bool a_done_err_zero = false;
+        bool a_done_err_zero = false, a_done_quiescent = false;
         int  seen_b_status = 0;
         for (const json::Value& ev : e.v.find("result.events").as_array()) {
             const std::string kind = ev.find("kind").as_string();
@@ -1243,6 +1243,7 @@ static void test_job_correlation()
                         job.find("terminal.correlation").as_string() == "matched";
                     a_done_err_zero =
                         job.find("terminal.error_code").as_number() == 0;
+                    a_done_quiescent = job.find("terminal.quiescent").as_bool();
                 } else if (jid == jidB && st == "printing") {
                     ++seen_b_print;
                 }
@@ -1257,6 +1258,7 @@ static void test_job_correlation()
         CHECK(a_print_no_terminal);
         CHECK(a_done_matched);
         CHECK(a_done_err_zero);
+        CHECK(a_done_quiescent);
         CHECK(seen_b_status >= 1);
     }
 
